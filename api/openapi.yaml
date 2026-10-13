@@ -2411,7 +2411,7 @@ components:
         distance_km:
           type: [number, 'null']
           description: To the college in the query, or the student's college; rounded to 0.1 km
-        cover_photo_url: { type: [string, 'null'], format: uri }
+        cover_photo_url: { type: [string, 'null'], format: uri-reference }
         is_shortlisted: { type: [boolean, 'null'], description: null when not signed in }
 
     StudentListingDetail:
@@ -2435,6 +2435,7 @@ components:
             latitude: { type: number }
             longitude: { type: number }
             radius_m: { type: integer, example: 500 }
+          required: [latitude, longitude, radius_m]
         rent_from: { $ref: '#/components/schemas/Money' }
         rent_to: { $ref: '#/components/schemas/Money' }
         deposit_from: { $ref: '#/components/schemas/Money' }
@@ -2448,8 +2449,9 @@ components:
           items:
             type: object
             additionalProperties: false
+            required: [url, caption]
             properties:
-              url: { type: string, format: uri }
+              url: { type: string, format: uri-reference }
               caption: { type: [string, 'null'] }
         amenities: { type: array, items: { type: string } }
         rooms:
@@ -2460,6 +2462,7 @@ components:
           items:
             type: object
             additionalProperties: false
+            required: [college, distance_km]
             properties:
               college: { type: string }
               distance_km: { type: number }
@@ -2478,6 +2481,7 @@ components:
     StudentRoomOption:
       type: object
       additionalProperties: false
+      required: [sharing, room_type, attached_bathroom, rent_per_bed, deposit_per_bed, available_beds, next_available_from]
       properties:
         sharing: { type: integer }
         room_type: { type: [string, 'null'], enum: [ac, non_ac, null] }
@@ -2526,6 +2530,15 @@ components:
         preferred_sharing: { type: array, items: { type: integer } }
         move_in_from: { type: string, format: date }
 
+    PreferredSlot:
+      type: object
+      additionalProperties: false
+      required: [date]
+      properties:
+        date: { type: string, format: date }
+        from: { type: string, pattern: '^\d{2}:\d{2}$', example: '17:00' }
+        to: { type: string, pattern: '^\d{2}:\d{2}$', example: '19:00' }
+
     StudentRequestCreate:
       type: object
       required: [property_code, type]
@@ -2536,13 +2549,7 @@ components:
           type: array
           maxItems: 3
           description: Required for type=visit
-          items:
-            type: object
-            required: [date]
-            properties:
-              date: { type: string, format: date }
-              from: { type: string, pattern: '^\d{2}:\d{2}$', example: '17:00' }
-              to: { type: string, pattern: '^\d{2}:\d{2}$', example: '19:00' }
+          items: { $ref: '#/components/schemas/PreferredSlot' }
         people_count: { type: integer, minimum: 1, maximum: 10, default: 1 }
         note: { type: string, maxLength: 500 }
         sharing_preference: { type: integer, minimum: 1 }
@@ -2567,7 +2574,7 @@ components:
         (or broker_contacted once a broker acted); visit_scheduled → visit_scheduled;
         visited/interested/negotiation → visited; assigned/brokerage_* → room_assigned;
         move_in_complete → moved_in; terminal → closed.
-      required: [id, property, type, display_status, created_at, updated_at]
+      required: [id, property, type, display_status, closed_reason, visits, broker_contact, brokerage, timeline, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         property: { $ref: '#/components/schemas/StudentListingCard' }
@@ -2590,6 +2597,7 @@ components:
           items:
             type: object
             additionalProperties: false
+            required: [at, label]
             properties:
               at: { type: string, format: date-time }
               label: { type: string, example: 'Visit confirmed for 14 Oct, 5:00 PM' }
@@ -2599,10 +2607,11 @@ components:
     StudentVisit:
       type: object
       additionalProperties: false
+      required: [id, status, preferred_slots, scheduled_at, people_count, meeting_point]
       properties:
         id: { type: string, format: uuid }
         status: { $ref: '#/components/schemas/VisitStatus' }
-        preferred_slots: { type: array, items: { type: object } }
+        preferred_slots: { type: array, items: { $ref: '#/components/schemas/PreferredSlot' } }
         scheduled_at: { type: [string, 'null'], format: date-time }
         people_count: { type: integer }
         meeting_point:
@@ -2788,7 +2797,7 @@ components:
         property: { $ref: '#/components/schemas/PropertySummary' }
         student_name: { type: string }
         status: { $ref: '#/components/schemas/VisitStatus' }
-        preferred_slots: { type: array, items: { type: object } }
+        preferred_slots: { type: array, items: { $ref: '#/components/schemas/PreferredSlot' } }
         scheduled_at: { type: [string, 'null'], format: date-time }
         people_count: { type: integer }
         student_note: { type: [string, 'null'] }
@@ -3111,6 +3120,7 @@ components:
     StudentBrokerage:
       type: object
       additionalProperties: false
+      required: [amount, explanation, status, paid_amount, acknowledged]
       properties:
         amount: { $ref: '#/components/schemas/Money' }
         explanation: { type: string, example: '1 month of rent (₹8,000)' }

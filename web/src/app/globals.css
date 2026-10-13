@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+/* Design tokens (docs/ui-ux-spec.md §10): 8px spacing, 10–16px card radius,
+   green success / amber attention / red critical / blue info. */
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --color-brand-50: #effaf8;
+  --color-brand-100: #d5f2ec;
+  --color-brand-200: #a9e3d8;
+  --color-brand-500: #14907e;
+  --color-brand-600: #0f7668;
+  --color-brand-700: #0d5f55;
+  --color-brand-900: #0b3a35;
+  --color-ink: #17212b;
+  --color-muted: #5b6876;
+  --color-line: #e3e8ee;
+  --color-canvas: #f6f8fa;
+  --color-success: #15803d;
+  --color-attention: #b45309;
+  --color-critical: #b91c1c;
+  --color-info: #1d4ed8;
+  --radius-card: 14px;
+  --radius-control: 10px;
+}
+
+html { -webkit-text-size-adjust: 100%; }
+body { background: var(--color-canvas); color: var(--color-ink); }
+
+:focus-visible { outline: 2px solid var(--color-brand-500); outline-offset: 2px; }
+
+@layer components {
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; min-height: 44px;
+       padding: 0 1.125rem; border-radius: var(--radius-control); font-weight: 600; font-size: .9375rem;
+       transition: background-color .15s, border-color .15s, color .15s; }
+.btn:disabled { opacity: .55; cursor: not-allowed; }
+.btn-primary { background: var(--color-brand-600); color: #fff; }
+.btn-primary:hover:not(:disabled) { background: var(--color-brand-700); }
+.btn-secondary { background: #fff; color: var(--color-ink); border: 1px solid var(--color-line); }
+.btn-secondary:hover:not(:disabled) { border-color: #c9d2dc; background: #fbfcfd; }
+.btn-ghost { color: var(--color-brand-700); }
+.btn-ghost:hover:not(:disabled) { background: var(--color-brand-50); }
+
+.card { background: #fff; border: 1px solid var(--color-line); border-radius: var(--radius-card); }
+.input { width: 100%; min-height: 44px; border: 1px solid #cfd7e0; border-radius: var(--radius-control);
+         padding: 0 .875rem; background: #fff; font-size: 1rem; }
+.input:focus { border-color: var(--color-brand-500); outline: none; box-shadow: 0 0 0 3px var(--color-brand-100); }
+.chip { display: inline-flex; align-items: center; gap: .375rem; min-height: 32px; padding: 0 .75rem;
+        border-radius: 999px; border: 1px solid var(--color-line); background: #fff; font-size: .8125rem; }
+.chip[aria-pressed="true"] { background: var(--color-brand-50); border-color: var(--color-brand-500); color: var(--color-brand-700); font-weight: 600; }
+.label { display: block; font-size: .8125rem; font-weight: 600; color: var(--color-muted); margin-bottom: .375rem; }
+}

@@ -5,8 +5,8 @@ Students browse and request visits. Brokers manage properties, rooms, beds,
 leads, visits, assignments and brokerage. The owner's contact details and the
 exact address are never exposed to students.
 
-**Stage:** foundation design (database schema + API contract). No
-application code yet.
+**Stage:** foundation design (schema + API contract) and the first
+clickable prototype (`web/`).
 
 ## Repository layout
 
@@ -23,6 +23,7 @@ application code yet.
 | `db/schema.sql` | PostgreSQL 16 reference DDL (source of truth until framework migrations exist) |
 | `db/tests/schema_rules_test.sql` | Database-level tests: allocation priority and eligibility, duplicate leads, bed double-booking, brokerage quote/overrides/statuses/credit, student-view privacy |
 | `api/openapi.yaml` | OpenAPI 3.1 contract for the web PWA and admin |
+| `web/` | Student prototype: login → marketplace → property → request visit (see `web/README.md`) |
 
 ## Running the schema tests
 
@@ -47,5 +48,5 @@ team's confirmation. Flutter is deferred until the product is validated.
 
 ## Next step
 
-Prototype: Student Marketplace → Property Detail → Request Visit, built on
-this schema and contract.
+Prototype step 2: broker app. Dashboard → offered lead → accept → visit →
+assignment with brokerage disclosure.

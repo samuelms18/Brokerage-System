@@ -2632,6 +2632,10 @@ components:
         accepting_leads: { type: boolean }
         active_leads: { type: integer }
         max_active_leads: { type: integer }
+        offered:
+          type: array
+          description: Leads offered to the caller and awaiting acceptance, soonest deadline first
+          items: { $ref: '#/components/schemas/LeadSummary' }
 
     BrokerAvailability:
       type: object

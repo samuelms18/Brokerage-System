@@ -6,6 +6,7 @@
 import type { components } from "@/lib/api-types";
 import { lookups, store } from "./store";
 import type { Lead, Property, Visit } from "./model";
+import { studentBrokerageView } from "./brokerage";
 
 type S = components["schemas"];
 export type StudentListingCard = S["StudentListingCard"];
@@ -170,15 +171,10 @@ export function toStudentRequest(l: Lead, ctx: { studentId: string; collegeId?: 
         }
       : null,
     // Student's own brokerage only; never the owner's.
-    brokerage: l.studentBrokerage
-      ? {
-          amount: money(l.studentBrokerage.amount),
-          explanation: l.studentBrokerage.explanation,
-          status: l.studentBrokerage.status,
-          paid_amount: money(l.studentBrokerage.paidAmount),
-          acknowledged: l.studentBrokerage.acknowledgedAt !== null,
-        }
-      : null,
+    brokerage: (() => {
+      const b = studentBrokerageView(l.id);
+      return b ? { amount: money(b.amount), explanation: b.explanation, status: b.status, paid_amount: money(b.paidAmount), acknowledged: b.acknowledged } : null;
+    })(),
     timeline: l.timeline.map((t) => ({ at: new Date(t.at).toISOString(), label: t.label })),
     created_at: new Date(l.createdAt).toISOString(),
     updated_at: new Date(l.updatedAt).toISOString(),

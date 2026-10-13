@@ -27,6 +27,8 @@ export interface User {
   name: string;
   phone: string;
   status: "active" | "suspended" | "deactivated";
+  /** Extra permissions beyond the role (Super Admin has all). */
+  canOverrideBrokerage?: boolean;
 }
 
 export interface Broker {
@@ -107,18 +109,114 @@ export interface LeadAssignmentEvent {
   previousBrokerId: string | null;
   newBrokerId: string | null;
   method: "automatic" | "manual";
-  reason: "property_broker" | "authorized_fallback" | "no_eligible_broker";
+  reason:
+    | "property_broker" | "authorized_fallback" | "queue_retry" | "no_eligible_broker"
+    | "broker_unavailable" | "response_timeout" | "broker_declined" | "manual_reassignment";
+  note?: string;
   responseDueAt: number | null;
+  acceptedAt?: number;
   at: number;
 }
 
-export interface StudentBrokerageState {
+export interface FollowUp {
+  id: string;
+  action: string;
+  dueAt: number;
+  status: "open" | "done" | "snoozed" | "cancelled";
+  brokerId: string | null;
+}
+
+export type Party = "student" | "owner";
+export type CalcType = "flat" | "percent_of_monthly_rent" | "months_of_rent";
+
+export interface Assignment {
+  id: string;
+  code: string;
+  leadId: string;
+  studentId: string;
+  propertyId: string;
+  roomId: string;
+  bedId: string;
+  brokerId: string;
+  status: "draft" | "pending_confirmation" | "reserved" | "confirmed" | "cancelled" | "completed";
+  rentSnapshot: number;
+  depositSnapshot: number;
+  moveInDate: string | null;
+  createdAt: number;
+  confirmedAt: number | null;
+  cancelReason: string | null;
+}
+
+export interface BrokeragePolicy {
+  id: string;
+  name: string;
+  areaId: string | null;
+  propertyType: PropertyType | null;
+  priority: number;
+  payerMode: "student" | "owner" | "both";
+  student: { calcType: CalcType; value: number } | null;
+  owner: { calcType: CalcType; value: number } | null;
+  isActive: boolean;
+  createdAt: number;
+}
+
+export interface BrokerageOverride {
+  id: string;
+  level: "property" | "assignment";
+  propertyId: string | null;
+  assignmentId: string | null;
+  party: Party;
+  calcType: CalcType | "not_charged";
+  value: number | null;
+  reason: string;
+  createdBy: string;
+  createdAt: number;
+  revokedAt: number | null;
+  revokedBy: string | null;
+  revokeReason: string | null;
+}
+
+export interface BrokerageDisclosure {
+  id: string;
+  assignmentId: string;
+  party: Party;
   amount: number;
   explanation: string;
-  status: "pending" | "partially_paid" | "paid" | "waived" | "cancelled" | "refund_pending" | "refunded";
-  paidAmount: number;
+  method: "in_app" | "whatsapp" | "phone" | "in_person" | "email";
+  disclosedBy: string;
+  disclosedAt: number;
   acknowledgedAt: number | null;
 }
+
+export type BrokerageStatus = "pending" | "partially_paid" | "paid" | "waived" | "cancelled" | "refund_pending" | "refunded";
+
+export interface BrokerageRecord {
+  id: string;
+  assignmentId: string;
+  party: Party;
+  source: "policy" | "property_override" | "assignment_override";
+  calcSnapshot: { calcType: CalcType; value: number; rentBase: number; explanation: string };
+  amount: number;
+  paidAmount: number;
+  status: BrokerageStatus;
+  creditedBrokerId: string;
+  creditHistory: { previousBrokerId: string | null; newBrokerId: string; reason: string; authorizedBy: string | null; at: number }[];
+  createdAt: number;
+}
+
+export interface Payment {
+  id: string;
+  brokerageId: string;
+  amount: number;
+  method: "upi" | "cash" | "bank_transfer";
+  reference: string | null;
+  receivedAt: string;
+  receiptNumber: string;
+  recordedBy: string;
+  createdAt: number;
+}
+
+export interface AuditEntry { at: number; actorId: string | null; action: string; entityType: string; entityId: string; metadata?: Record<string, unknown> }
 
 export interface Lead {
   id: string;
@@ -136,8 +234,8 @@ export interface Lead {
   updatedAt: number;
   timeline: { at: number; label: string }[];
   assignments: LeadAssignmentEvent[];
-  /** Student's own brokerage, once disclosed (prototype simulation). */
-  studentBrokerage: StudentBrokerageState | null;
+  followUps: FollowUp[];
+  lostReason: string | null;
 }
 
 export const TERMINAL_LEAD_STATUSES: LeadStatus[] = [

@@ -3,7 +3,7 @@
 // Data resets when the server restarts.
 
 import * as seed from "./seed";
-import type { Broker, Lead, Owner, Property, Student, User, Visit } from "./model";
+import type { Assignment, AuditEntry, Broker, BrokerageDisclosure, BrokerageOverride, BrokeragePolicy, BrokerageRecord, Lead, Owner, Payment, Property, Student, User, Visit } from "./model";
 
 export interface Session { token: string; userId: string; expiresAt: number }
 export interface OtpChallenge { id: string; phone: string; code: string; attempts: number; expiresAt: number; consumed: boolean }
@@ -20,7 +20,14 @@ export interface Store {
   visits: Visit[];
   shortlists: Map<string, Set<string>>; // studentId -> property ids
   idempotency: Map<string, { at: number; body: unknown }>;
-  seq: { lead: number };
+  assignments: Assignment[];
+  policies: BrokeragePolicy[];
+  overrides: BrokerageOverride[];
+  disclosures: BrokerageDisclosure[];
+  brokerages: BrokerageRecord[];
+  payments: Payment[];
+  audit: AuditEntry[];
+  seq: { lead: number; assignment: number; receipt: number };
 }
 
 function fresh(): Store {
@@ -37,7 +44,14 @@ function fresh(): Store {
     visits: [],
     shortlists: new Map(),
     idempotency: new Map(),
-    seq: { lead: 20480 },
+    assignments: [],
+    policies: clone(seed.brokeragePolicies),
+    overrides: [],
+    disclosures: [],
+    brokerages: [],
+    payments: [],
+    audit: [],
+    seq: { lead: 20480, assignment: 3300, receipt: 0 },
   };
 }
 
@@ -55,6 +69,10 @@ export function resetStore(): Store {
 }
 
 export const lookups = { areas: seed.areas, colleges: seed.colleges, amenities: seed.amenities };
+
+export function audit(actorId: string | null, action: string, entityType: string, entityId: string, metadata?: Record<string, unknown>) {
+  store().audit.push({ at: Date.now(), actorId, action, entityType, entityId, metadata });
+}
 
 export function newId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;

@@ -5,12 +5,14 @@ import { store } from "./store";
 import type { User } from "./model";
 
 type ProblemCode =
+  | "LEAD_NOT_OFFERED_TO_YOU" | "BED_NOT_AVAILABLE" | "DUPLICATE_ACTIVE_LEAD" | "BROKERAGE_NOT_DISCLOSED" | "OVERPAYMENT"
   | "VALIDATION_FAILED" | "UNAUTHENTICATED" | "OTP_INVALID" | "SESSION_EXPIRED" | "FORBIDDEN" | "NOT_FOUND"
   | "RATE_LIMITED" | "INVALID_STATUS_TRANSITION" | "PROPERTY_NOT_AVAILABLE";
 
 const STATUS: Record<ProblemCode, number> = {
   VALIDATION_FAILED: 422, UNAUTHENTICATED: 401, OTP_INVALID: 401, SESSION_EXPIRED: 401, FORBIDDEN: 403,
   NOT_FOUND: 404, RATE_LIMITED: 429, INVALID_STATUS_TRANSITION: 409, PROPERTY_NOT_AVAILABLE: 409,
+  LEAD_NOT_OFFERED_TO_YOU: 409, BED_NOT_AVAILABLE: 409, DUPLICATE_ACTIVE_LEAD: 409, BROKERAGE_NOT_DISCLOSED: 409, OVERPAYMENT: 422,
 };
 
 export function problem(code: ProblemCode, title: string, extra: { errors?: Record<string, string[]> } = {}) {
@@ -38,6 +40,23 @@ export async function requireStudentApi(): Promise<{ user: User; collegeId: stri
   return { user, collegeId: store().students.get(user.id)?.collegeId ?? null };
 }
 
+/** Route-handler guard for broker endpoints (Super Admin may also call them). */
+export async function requireBrokerApi(): Promise<{ user: User } | NextResponse> {
+  const user = await currentUser();
+  if (!user) return problem("UNAUTHENTICATED", "Log in to continue");
+  if (user.role !== "broker" && user.role !== "super_admin") return problem("FORBIDDEN", "Broker account required");
+  return { user };
+}
+
+/** Maps domain errors (BrokerError, BrokerageError, RequestError) to problem responses. */
+export function fromError(e: unknown) {
+  if (e instanceof Error && "code" in e) {
+    const err = e as Error & { code: ProblemCode; errors?: Record<string, string[]> };
+    if (err.code in STATUS) return problem(err.code, err.message, { errors: err.errors });
+  }
+  throw e;
+}
+
 export async function readJson<T>(req: Request): Promise<T | null> {
   try {
     return (await req.json()) as T;
@@ -46,4 +65,3 @@ export async function readJson<T>(req: Request): Promise<T | null> {
   }
 }
 
-export const prototypeToolsEnabled = () => process.env.PROTOTYPE_TOOLS !== "off";

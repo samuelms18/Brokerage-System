@@ -136,7 +136,7 @@ collection rate per party.
 1. **Student:** Login (with return) → Marketplace → Property Detail →
    Request Visit → Request Received → My Requests *(built in `web/`)*
 2. **Broker:** Dashboard → Offered lead → Accept → Visit → Assignment with
-   brokerage disclosure
-3. Brokerage ledger / receipt
+   brokerage disclosure *(built in `web/`)*
+3. Brokerage ledger / receipt *(ledger and manual payments built; receipt PDF pending)*
 
 Validate these before advanced AI or analytics.

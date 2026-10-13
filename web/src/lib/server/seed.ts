@@ -2,7 +2,7 @@
 // fictional. Owner records and exact addresses are included ON PURPOSE so
 // the privacy tests can prove they never reach a student response.
 
-import type { Amenity, Area, Bed, BedStatus, Broker, College, Owner, Property, Room, User } from "./model";
+import type { Amenity, Area, Bed, BedStatus, Broker, BrokeragePolicy, College, Owner, Property, Room, User } from "./model";
 
 export const areas: Area[] = [
   { id: "area-north", name: "North Campus", city: "Pune" },
@@ -33,7 +33,8 @@ export const amenities: Amenity[] = [
 
 export const staffUsers: User[] = [
   { id: "u-admin", role: "super_admin", name: "Platform Admin", phone: "+910000000001", status: "active" },
-  { id: "u-broker-asha", role: "broker", name: "Asha Kulkarni", phone: "+919800000011", status: "active" },
+  // Asha holds the brokerage-override permission in the demo only (who should have it is open question BR-1).
+  { id: "u-broker-asha", role: "broker", name: "Asha Kulkarni", phone: "+919800000011", status: "active", canOverrideBrokerage: true },
   { id: "u-broker-ravi", role: "broker", name: "Ravi Menon", phone: "+919800000012", status: "active" },
   { id: "u-broker-neha", role: "broker", name: "Neha Joshi", phone: "+919800000013", status: "active" },
 ];
@@ -210,5 +211,20 @@ export const properties: Property[] = [
     photos: [{ hue: 60, scene: "room", caption: "Room", isPublic: true }],
     rooms: [room("r-1008-1", "Room 1", 2, 6000, 12000, {})],
     private: { ownerId: "own-2", addressLine1: "5 River Lane", landmark: "", pincode: "411001", latitude: 18.51601, longitude: 73.85902 },
+  },
+];
+
+/**
+ * EXAMPLE policy so the brokerage flow can be demonstrated. The real values
+ * are configured by Super Admin (decision D-04); nothing here is a business
+ * decision.
+ */
+export const brokeragePolicies: BrokeragePolicy[] = [
+  {
+    id: "pol-example", name: "Example policy (replace with real values)", areaId: null, propertyType: null, priority: 0,
+    payerMode: "both",
+    student: { calcType: "percent_of_monthly_rent", value: 50 },
+    owner: { calcType: "flat", value: 2000 },
+    isActive: true, createdAt: 0,
   },
 ];

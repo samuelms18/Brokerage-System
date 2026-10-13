@@ -43,10 +43,8 @@ test("shared link → login → back to the property → request visit → Reque
   await expect(page.getByRole("heading", { name: "Request Received" })).toBeVisible();
   await expect(page.getByText("Your property request has been received. Our broker will contact you shortly.")).toBeVisible();
 
-  // Broker contact appears only after the broker accepts.
+  // Broker contact appears only after a broker accepts (covered in broker-flow.spec.ts).
   await expect(page.getByText("Their name and number appear here once they take up your request")).toBeVisible();
-  await page.getByRole("button", { name: "Simulate: broker accepts" }).click();
-  await expect(page.getByText("+912040000011")).toBeVisible();
 
   // The property page now points to the existing request instead of creating a duplicate.
   await page.goto("/p/PR-1001");

@@ -1890,6 +1890,8 @@ export interface components {
             accepting_leads?: boolean;
             active_leads?: number;
             max_active_leads?: number;
+            /** @description Leads offered to the caller and awaiting acceptance, soonest deadline first */
+            offered?: components["schemas"]["LeadSummary"][];
         };
         BrokerAvailability: {
             accepting_leads?: boolean;

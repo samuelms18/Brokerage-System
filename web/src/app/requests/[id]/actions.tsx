@@ -49,22 +49,14 @@ export function CancelRequestButton({ requestId }: { requestId: string }) {
   );
 }
 
-/** PROTOTYPE ONLY: stands in for the broker app until it is built. */
-export function PrototypeControls({ requestId, accepted, hasBrokerage }: { requestId: string; accepted: boolean; hasBrokerage: boolean }) {
+export function ConfirmVisitButton({ visitId }: { visitId: string }) {
   const { busy, error, run } = useAction();
   return (
-    <aside className="rounded-xl border-2 border-dashed border-amber-300 bg-amber-50/60 p-4" aria-label="Prototype controls">
-      <p className="text-sm font-semibold text-attention">Prototype controls</p>
-      <p className="mt-1 text-xs text-muted">Simulate what a broker does in the broker app (not built yet). Students never see this panel.</p>
-      <div className="mt-3 flex flex-wrap gap-2">
-        <button type="button" className="btn btn-secondary" disabled={busy || accepted} onClick={() => run(`/api/prototype/requests/${requestId}/accept`)}>
-          {accepted ? "Broker has accepted ✓" : "Simulate: broker accepts"}
-        </button>
-        <button type="button" className="btn btn-secondary" disabled={busy || !accepted || hasBrokerage} onClick={() => run(`/api/prototype/requests/${requestId}/disclose-brokerage`)}>
-          {hasBrokerage ? "Brokerage shared ✓" : "Simulate: broker shares brokerage"}
-        </button>
-      </div>
+    <>
+      <button type="button" className="btn btn-primary mt-2" disabled={busy} onClick={() => run(`/api/v1/student/visits/${visitId}/confirm`)}>
+        Confirm this time
+      </button>
       {error && <p role="alert" className="mt-2 text-sm text-critical">{error}</p>}
-    </aside>
+    </>
   );
 }

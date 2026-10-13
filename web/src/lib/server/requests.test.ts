@@ -3,7 +3,7 @@ import { resetStore, store } from "./store";
 import { signUpStudent } from "./test-helpers";
 import { createStudentRequest, eligibleBrokers, getStudentLead, listStudentRequests, RequestError } from "./requests";
 import { setShortlisted } from "./shortlist";
-import { simulateBrokerAccept } from "./prototype-tools";
+import { accept } from "./broker";
 import { toStudentRequest } from "./student-dto";
 
 const visit = (code: string) => ({ property_code: code, type: "visit" as const, preferred_slots: [{ date: "2099-01-01", from: "17:00", to: "19:00" }] });
@@ -87,7 +87,7 @@ describe("request visit and lead allocation", () => {
     const before = toStudentRequest(getStudentLead(studentId, request_id)!, { studentId });
     expect(before.broker_contact).toBeNull();
     expect(before.display_status).toBe("request_received");
-    simulateBrokerAccept(studentId, request_id);
+    accept("u-broker-asha", request_id);
     const after = toStudentRequest(getStudentLead(studentId, request_id)!, { studentId });
     expect(after.broker_contact?.display_name).toBe("Asha K.");
     expect(after.display_status).toBe("broker_contacted");

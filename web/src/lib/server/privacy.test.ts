@@ -3,7 +3,8 @@ import { resetStore, store } from "./store";
 import { signUpStudent } from "./test-helpers";
 import { listingDetail, searchListings, parseListingQuery } from "./listings";
 import { createStudentRequest, listStudentRequests } from "./requests";
-import { simulateBrokerAccept, simulateBrokerageDisclosure } from "./prototype-tools";
+import { accept, bedsForLead, createAssignment } from "./broker";
+import { disclose } from "./brokerage";
 import { shortlistCards, setShortlisted } from "./shortlist";
 import * as seed from "./seed";
 
@@ -50,8 +51,11 @@ describe("student responses never contain private data", () => {
 
   it("requests, including after broker acceptance and brokerage disclosure", () => {
     const { request_id } = createStudentRequest(studentId, { property_code: "PR-1001", type: "visit", preferred_slots: [{ date: "2099-01-01" }] });
-    simulateBrokerAccept(studentId, request_id);
-    simulateBrokerageDisclosure(studentId, request_id);
+    accept("u-broker-asha", request_id);
+    const bed = bedsForLead("u-broker-asha", request_id).find((x) => x.bed.status === "available")!.bed;
+    const a = createAssignment("u-broker-asha", request_id, bed.id);
+    disclose(a, "student", "in_app", "u-broker-asha");
+    disclose(a, "owner", "phone", "u-broker-asha");
     const reqs = listStudentRequests(studentId, "all");
     // Broker's BUSINESS phone is allowed once accepted; staff personal phones are not.
     expect(JSON.stringify(reqs)).toContain("+912040000011");

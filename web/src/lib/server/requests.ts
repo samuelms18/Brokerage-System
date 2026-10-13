@@ -4,10 +4,11 @@
 // there is no background sweeper or queue retry.
 
 import type { components } from "@/lib/api-types";
-import { newId, store } from "./store";
-import { isActiveLead, type Broker, type Lead, type Property } from "./model";
+import { audit, newId, store } from "./store";
+import { isActiveLead, type Broker, type Lead, type LeadAssignmentEvent, type Property } from "./model";
 import { findStudentVisible } from "./listings";
 import { toStudentRequest } from "./student-dto";
+import { latestDisclosure } from "./brokerage";
 
 type RequestCreate = components["schemas"]["StudentRequestCreate"];
 export type RequestReceived = components["schemas"]["RequestReceived"];
@@ -51,14 +52,32 @@ export function eligibleBrokers(p: Property, excluded: string[] = [], at = Date.
     || a.userId.localeCompare(b.userId));
 }
 
-function allocate(lead: Lead, p: Property, now: number) {
+/** Brokers who already timed out on, declined, or went unavailable for this lead. */
+export function excludedBrokers(lead: Lead): string[] {
+  return lead.assignments
+    .filter((e) => ["response_timeout", "broker_declined", "broker_unavailable"].includes(e.reason) && e.previousBrokerId)
+    .map((e) => e.previousBrokerId!);
+}
+
+/**
+ * Offers the lead to the best eligible broker, or puts it in the Unassigned
+ * Queue. `trigger` is why allocation runs: a new request, a queue retry, or
+ * the previous broker timing out / declining / becoming unavailable.
+ */
+export function allocate(lead: Lead, p: Property, now: number, trigger: "new" | LeadAssignmentEvent["reason"] = "new") {
   const s = store();
-  const chosen = eligibleBrokers(p, [], now)[0];
+  const previous = lead.brokerId;
+  const excluded = excludedBrokers(lead);
+  if (previous && ["response_timeout", "broker_declined", "broker_unavailable"].includes(trigger)) excluded.push(previous);
+  const chosen = eligibleBrokers(p, excluded, now)[0];
+  for (const f of lead.followUps) if (f.status === "open" || f.status === "snoozed") f.brokerId = chosen?.userId ?? null;
   if (!chosen) {
     lead.allocationStatus = "unassigned";
     lead.brokerId = null;
+    lead.responseDueAt = null;
     lead.queuedAt = now;
-    lead.assignments.push({ previousBrokerId: null, newBrokerId: null, method: "automatic", reason: "no_eligible_broker", responseDueAt: null, at: now });
+    lead.assignments.push({ previousBrokerId: previous, newBrokerId: null, method: "automatic", reason: trigger === "new" || trigger === "queue_retry" ? "no_eligible_broker" : trigger, responseDueAt: null, at: now });
+    audit(null, "lead.queued", "lead", lead.id, { previous });
     // Real system: notify users with receives_ops_alerts.
     return;
   }
@@ -67,15 +86,14 @@ function allocate(lead: Lead, p: Property, now: number) {
   lead.responseDueAt = now + RESPONSE_WINDOW_MS;
   lead.queuedAt = null;
   s.brokers.get(chosen.userId)!.lastAssignedAt = now;
-  lead.assignments.push({
-    previousBrokerId: null,
-    newBrokerId: chosen.userId,
-    method: "automatic",
-    reason: chosen.userId === p.brokerId ? "property_broker" : "authorized_fallback",
-    responseDueAt: lead.responseDueAt,
-    at: now,
-  });
-  // Real system: push notification + follow-up task for the broker.
+  const reason: LeadAssignmentEvent["reason"] = trigger !== "new" ? trigger
+    : chosen.userId === p.brokerId ? "property_broker" : "authorized_fallback";
+  lead.assignments.push({ previousBrokerId: previous, newBrokerId: chosen.userId, method: "automatic", reason, responseDueAt: lead.responseDueAt, at: now });
+  if (!lead.followUps.some((f) => f.status === "open")) {
+    lead.followUps.push({ id: newId("fu"), action: "Respond to new lead", dueAt: lead.responseDueAt, status: "open", brokerId: chosen.userId });
+  }
+  audit(null, "lead.offered", "lead", lead.id, { broker: chosen.userId, reason, previous });
+  // Real system: push notification to the broker (and to the previous one on reassignment).
 }
 
 function validate(body: RequestCreate): Record<string, string[]> {
@@ -134,7 +152,8 @@ export function createStudentRequest(studentId: string, body: RequestCreate, ide
       updatedAt: now,
       timeline: [{ at: now, label: body.type === "visit" ? "Visit requested" : "Interest sent" }],
       assignments: [],
-      studentBrokerage: null,
+      followUps: [],
+      lostReason: null,
     };
     s.leads.push(lead);
     allocate(lead, property, now);
@@ -188,10 +207,27 @@ export function cancelStudentRequest(studentId: string, id: string) {
 export function acknowledgeBrokerage(studentId: string, id: string) {
   const lead = getStudentLead(studentId, id);
   if (!lead) throw new RequestError("NOT_FOUND", "Request not found");
-  if (!lead.studentBrokerage) throw new RequestError("INVALID_STATUS_TRANSITION", "There is no brokerage amount to acknowledge yet.");
-  if (lead.studentBrokerage.acknowledgedAt === null) {
-    lead.studentBrokerage.acknowledgedAt = Date.now();
+  const a = store().assignments.filter((x) => x.leadId === lead.id && x.status !== "cancelled").sort((x, y) => y.createdAt - x.createdAt)[0];
+  const d = a ? latestDisclosure(a.id, "student") : undefined;
+  if (!d) throw new RequestError("INVALID_STATUS_TRANSITION", "There is no brokerage amount to acknowledge yet.");
+  if (d.acknowledgedAt === null) {
+    d.acknowledgedAt = Date.now();
     lead.timeline.push({ at: Date.now(), label: "You acknowledged the brokerage amount" });
+    audit(studentId, "brokerage.acknowledged", "assignment", a!.id, { amount: d.amount });
   }
+  return lead;
+}
+
+/** Student accepts the time the broker proposed. */
+export function confirmVisit(studentId: string, visitId: string) {
+  const s = store();
+  const v = s.visits.find((x) => x.id === visitId);
+  const lead = v ? getStudentLead(studentId, v.leadId) : undefined;
+  if (!v || !lead) throw new RequestError("NOT_FOUND", "Visit not found");
+  if (v.status !== "proposed" && v.status !== "rescheduled") throw new RequestError("INVALID_STATUS_TRANSITION", "There is no proposed time to confirm.");
+  v.status = "confirmed";
+  if (["new", "contacted", "requirement_confirmed", "properties_suggested"].includes(lead.status)) lead.status = "visit_scheduled";
+  lead.updatedAt = Date.now();
+  lead.timeline.push({ at: Date.now(), label: "You confirmed the visit time" });
   return lead;
 }

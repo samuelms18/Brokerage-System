@@ -2,6 +2,13 @@ import { AuthError, SESSION_COOKIE, sanitizeReturnTo, verifyOtp } from "@/lib/se
 import { json, problem, readJson } from "@/lib/server/http";
 import { toMe } from "@/lib/server/me";
 
+/** Staff land in the broker app; students never get sent into it. */
+function homeFor(role: string, path: string) {
+  const brokerPath = path === "/broker" || path.startsWith("/broker/");
+  if (role === "student") return brokerPath ? "/" : path;
+  return brokerPath ? path : "/broker";
+}
+
 export async function POST(req: Request) {
   const body = await readJson<{ challenge_id?: string; code?: string; name?: string; return_to?: string }>(req);
   try {
@@ -10,7 +17,7 @@ export async function POST(req: Request) {
       access_token: session.token,
       expires_at: new Date(session.expiresAt).toISOString(),
       user: toMe(user),
-      redirect_to: sanitizeReturnTo(body?.return_to),
+      redirect_to: homeFor(user.role, sanitizeReturnTo(body?.return_to)),
     });
     res.cookies.set(SESSION_COOKIE, session.token, {
       httpOnly: true,

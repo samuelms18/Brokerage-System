@@ -9,7 +9,8 @@ export const metadata: Metadata = { title: "Log in" };
 export default async function LoginPage({ searchParams }: { searchParams: Promise<{ next?: string }> }) {
   const { next } = await searchParams;
   const returnTo = sanitizeReturnTo(next);
-  if (await currentUser()) redirect(returnTo);
+  const user = await currentUser();
+  if (user) redirect(user.role === "student" ? returnTo : "/broker");
   const fromProperty = returnTo.startsWith("/p/");
 
   return (

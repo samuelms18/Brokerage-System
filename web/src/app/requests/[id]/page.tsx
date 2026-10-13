@@ -4,9 +4,8 @@ import { notFound } from "next/navigation";
 import { requireStudentPage } from "@/lib/page-auth";
 import { getStudentLead } from "@/lib/server/requests";
 import { toStudentRequest } from "@/lib/server/student-dto";
-import { prototypeToolsEnabled } from "@/lib/server/http";
 import { StatusPill } from "@/components/StatusPill";
-import { AcknowledgeButton, CancelRequestButton, PrototypeControls } from "./actions";
+import { AcknowledgeButton, CancelRequestButton, ConfirmVisitButton } from "./actions";
 import { STATUS_LABEL, formatDate, formatDateTime, inr, sentence } from "@/lib/format";
 
 export const metadata: Metadata = { title: "Request" };
@@ -104,7 +103,10 @@ export default async function RequestPage({ params, searchParams }: { params: Pr
               <li key={v.id} className="text-sm">
                 <p className="font-semibold">{sentence(v.status)} · {v.people_count} {v.people_count === 1 ? "person" : "people"}</p>
                 {v.scheduled_at
-                  ? <p>Scheduled for {formatDateTime(v.scheduled_at)}</p>
+                  ? <>
+                      <p>{v.status === "proposed" || v.status === "rescheduled" ? "Your broker proposed" : "Scheduled for"} <strong>{formatDateTime(v.scheduled_at)}</strong></p>
+                      {(v.status === "proposed" || v.status === "rescheduled") && <ConfirmVisitButton visitId={v.id} />}
+                    </>
                   : <p className="text-muted">Your preferred times: {v.preferred_slots?.map((s) => `${formatDate(s.date, { weekday: "short", day: "numeric", month: "short" })} ${s.from ?? ""}–${s.to ?? ""}`).join(", ")}</p>}
               </li>
             ))}
@@ -125,7 +127,12 @@ export default async function RequestPage({ params, searchParams }: { params: Pr
       </section>
 
       {!closed && <CancelRequestButton requestId={r.id} />}
-      {prototypeToolsEnabled() && !closed && <PrototypeControls requestId={r.id} accepted={!!r.broker_contact} hasBrokerage={!!r.brokerage} />}
+      {process.env.PROTOTYPE_TOOLS !== "off" && !closed && !r.broker_contact && (
+        <aside className="rounded-xl border-2 border-dashed border-amber-300 bg-amber-50/60 p-4 text-sm" aria-label="Prototype note">
+          <p className="font-semibold text-attention">Prototype demo</p>
+          <p className="mt-1 text-muted">To act as the broker, open a private window and log in with <strong>98000 00011</strong> (Asha, broker for North Campus), <strong>98000 00012</strong> (Ravi) or <strong>98000 00013</strong> (Neha). The code is 123456.</p>
+        </aside>
+      )}
     </div>
   );
 }

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Student Rental Brokerage Platform API
-  version: 0.1.0-draft
+  version: 0.2.0-draft
   description: |
     API contract for the MVP (web PWA + single backend).
 
@@ -14,6 +14,13 @@ info:
     - Money is a decimal string in INR (`"8500.00"`) to avoid float rounding.
     - Mutating student endpoints accept an `Idempotency-Key` header, so a
       double tap never creates two requests.
+
+    **Login wall (D-02)**: every endpoint except `/auth/otp/*` requires a
+    signed-in user, including `/listings`. Shared listing links open the web
+    route `/p/{code}`. The web app sends signed-out users to
+    `/login?next=/p/{code}` and returns them to that property after OTP.
+    `next` must be a same-site relative path; the server re-validates it as
+    `return_to` (see `/auth/otp/verify`) to prevent open redirects.
 
     **Privacy contract (non-negotiable)**
     - Everything under `/listings` and `/student` returns only the `Student*`
@@ -58,6 +65,8 @@ tags:
   - name: Admin – Brokers
   - name: Admin – Allocation
   - name: Admin – Properties
+  - name: Admin – Brokerage
+    description: Waivers, refunds and brokerage credit.
   - name: Admin – Configuration
   - name: Admin – Audit & Reports
 
@@ -111,6 +120,9 @@ paths:
                 challenge_id: { type: string, format: uuid }
                 code: { type: string, pattern: '^[0-9]{6}$' }
                 name: { type: string, description: Required on first login. }
+                return_to:
+                  type: string
+                  description: Path the user came from, e.g. `/p/PR-1042`. Only same-site relative paths are accepted.
       responses:
         '200':
           description: Signed in
@@ -118,11 +130,14 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [access_token, expires_at, user]
+                required: [access_token, expires_at, user, redirect_to]
                 properties:
                   access_token: { type: string }
                   expires_at: { type: string, format: date-time }
                   user: { $ref: '#/components/schemas/Me' }
+                  redirect_to:
+                    type: string
+                    description: The validated `return_to`, or `/` when it was missing or not a same-site relative path.
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '429': { $ref: '#/components/responses/RateLimited' }
 
@@ -153,8 +168,7 @@ paths:
       operationId: getListings
       tags: [Marketplace]
       summary: Search student-visible properties
-      description: Public by default (decision D-02). Reads only the student read model.
-      security: [{}, { bearerAuth: [] }]
+      description: Requires login (D-02). Reads only the student read model. Only verified, published properties appear.
       parameters:
         - { name: q, in: query, schema: { type: string }, description: 'Property title, area, college or landmark text' }
         - { name: area_id, in: query, schema: { type: array, items: { type: string, format: uuid } }, style: form, explode: true }
@@ -202,7 +216,7 @@ paths:
       operationId: getListingsById
       tags: [Marketplace]
       summary: Property detail (student-safe)
-      security: [{}, { bearerAuth: [] }]
+      description: Requires login. Signed-out users opening a shared link are sent to login and returned here.
       parameters:
         - { $ref: '#/components/parameters/PropertyCode' }
       responses:
@@ -218,7 +232,6 @@ paths:
       operationId: getLookups
       tags: [Marketplace]
       summary: Areas, colleges and amenities for filters and forms
-      security: [{}, { bearerAuth: [] }]
       responses:
         '200':
           description: OK
@@ -296,8 +309,11 @@ paths:
     post:
       operationId: postStudentRequests
       tags: [Student – Requests]
-      summary: Request a visit or express interest
+      summary: Request a visit or express interest (creates or reuses a lead)
       description: |
+        These are the only student actions that create a lead (D-16).
+        Shortlisting never creates one.
+
         Runs the automatic allocation flow (docs/broker-allocation.md §5):
         1. If an active lead exists for this student and property, it is
            reused. The visit request or interest is attached; no new lead
@@ -381,6 +397,22 @@ paths:
       responses:
         '200':
           description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StudentRequest' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  /student/requests/{requestId}/brokerage/acknowledge:
+    post:
+      operationId: postStudentRequestsBrokerageAcknowledge
+      tags: [Student – Requests]
+      summary: Acknowledge the brokerage amount shown
+      description: Records `acknowledged_at` on the latest disclosure. Whether acknowledgement is REQUIRED before confirmation is open question BR-6; until decided, confirmation requires disclosure only.
+      parameters:
+        - { name: requestId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Acknowledged
           content:
             application/json:
               schema: { $ref: '#/components/schemas/StudentRequest' }
@@ -596,7 +628,7 @@ paths:
         - { name: allocation_status, in: query, schema: { $ref: '#/components/schemas/AllocationStatus' } }
         - { name: follow_up, in: query, schema: { type: string, enum: [overdue, today, upcoming] } }
         - { name: active, in: query, schema: { type: boolean, default: true } }
-        - { name: q, in: query, schema: { type: string }, description: 'Student name/phone, lead code, property code' }
+        - { name: q, in: query, schema: { type: string }, description: 'Student name, lead code, property code. Phone search matches accepted leads only.' }
         - { $ref: '#/components/parameters/Page' }
         - { $ref: '#/components/parameters/PerPage' }
       responses:
@@ -1360,7 +1392,10 @@ paths:
       description: |
         - `pending_confirmation` / `reserved` → bed reserved.
         - `confirmed` → freezes the snapshot, bed → occupied, lead → `assigned`,
-          and **creates the brokerage record(s)** from the matching rule.
+          and **creates one brokerage record per charged party** from
+          `brokerage-quote`, credited to the broker responsible for this
+          assignment (D-15). Refused with `BROKERAGE_NOT_DISCLOSED` unless every
+          charged party has a disclosure matching the current quote.
         - `completed` (move-in) → requires `moved_in_at`; lead → `move_in_complete`
           once the brokerage is paid.
         - `cancelled` → bed → available; any unpaid brokerage → cancelled.
@@ -1385,7 +1420,163 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Assignment' }
+        '409':
+          description: '`INVALID_STATUS_TRANSITION`, `BED_NOT_AVAILABLE` or `BROKERAGE_NOT_DISCLOSED`'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /broker/assignments/{assignmentId}/brokerage-quote:
+    get:
+      operationId: getBrokerAssignmentsBrokerageQuote
+      tags: [Broker – Brokerage]
+      summary: Brokerage each party will owe, and whether it has been shown to them
+      description: Same calculation used at confirmation (DB function `brokerage_quote`). Parties that are not charged are omitted.
+      parameters:
+        - { $ref: '#/components/parameters/AssignmentId' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerageQuote' }
+
+  /broker/assignments/{assignmentId}/brokerage-disclosures:
+    post:
+      operationId: postBrokerAssignmentsBrokerageDisclosures
+      tags: [Broker – Brokerage]
+      summary: Record that a party was shown their brokerage amount
+      description: |
+        The amount is taken from the current quote, never from the request.
+        `method: in_app` (student only) also sends the student a notification
+        and shows the amount on their request screen. For the owner, the
+        broker records how the amount was communicated.
+      parameters:
+        - { $ref: '#/components/parameters/AssignmentId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [party, method]
+              properties:
+                party: { $ref: '#/components/schemas/Party' }
+                method: { type: string, enum: [in_app, whatsapp, phone, in_person, email] }
+      responses:
+        '201':
+          description: Recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerageQuote' }
+        '422':
+          description: '`VALIDATION_FAILED` (e.g. in_app for the owner, or the party is not charged)'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /broker/assignments/{assignmentId}/brokerage-overrides:
+    get:
+      operationId: getBrokerAssignmentsBrokerageOverrides
+      tags: [Broker – Brokerage]
+      summary: Assignment-level override history (active and revoked)
+      parameters:
+        - { $ref: '#/components/parameters/AssignmentId' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/BrokerageOverride' } }
+    post:
+      operationId: postBrokerAssignmentsBrokerageOverrides
+      tags: [Broker – Brokerage]
+      summary: Override one party's brokerage for this assignment (reason required)
+      description: |
+        Requires `can_override_brokerage` (Super Admin always). Allowed only
+        before confirmation. Replaces any active assignment-level override for
+        that party (the old one is revoked with the same reason). Earlier
+        disclosures for that party stop counting if the amount changes.
+      parameters:
+        - { $ref: '#/components/parameters/AssignmentId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BrokerageOverrideCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerageOverride' }
+        '403': { description: '`FORBIDDEN`: missing can_override_brokerage' }
         '409': { $ref: '#/components/responses/InvalidTransition' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /broker/properties/{propertyId}/brokerage-overrides:
+    get:
+      operationId: getBrokerPropertiesBrokerageOverrides
+      tags: [Broker – Brokerage]
+      summary: Property-level override history (active and revoked)
+      parameters:
+        - { $ref: '#/components/parameters/PropertyId' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/BrokerageOverride' } }
+    post:
+      operationId: postBrokerPropertiesBrokerageOverrides
+      tags: [Broker – Brokerage]
+      summary: Override one party's brokerage for every future assignment at this property (reason required)
+      description: Requires `can_override_brokerage`. Does not change brokerages already created.
+      parameters:
+        - { $ref: '#/components/parameters/PropertyId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BrokerageOverrideCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerageOverride' }
+        '403': { description: '`FORBIDDEN`: missing can_override_brokerage' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /broker/brokerage-overrides/{overrideId}/revoke:
+    post:
+      operationId: postBrokerBrokerageOverridesRevoke
+      tags: [Broker – Brokerage]
+      summary: Revoke an override (reason required; the row is kept)
+      parameters:
+        - { name: overrideId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 3 }
+      responses:
+        '200':
+          description: Revoked
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerageOverride' }
+        '403': { description: '`FORBIDDEN`' }
 
   /broker/assignments/{assignmentId}/vacate:
     post:
@@ -1415,9 +1606,11 @@ paths:
     get:
       operationId: getBrokerBrokerages
       tags: [Broker – Brokerage]
-      summary: Brokerage ledger
+      summary: Brokerage ledger (one row per party per assignment)
       parameters:
         - { name: status, in: query, schema: { type: array, items: { $ref: '#/components/schemas/BrokerageStatus' } }, style: form, explode: true }
+        - { name: party, in: query, schema: { $ref: '#/components/schemas/Party' } }
+        - { name: credited_to_me, in: query, schema: { type: boolean } }
         - { $ref: '#/components/parameters/Page' }
         - { $ref: '#/components/parameters/PerPage' }
       responses:
@@ -1451,7 +1644,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Payment' }
         '422':
-          description: '`OVERPAYMENT` or validation failure'
+          description: '`OVERPAYMENT`, `BROKERAGE_NOT_PAYABLE` (waived/cancelled/refunded) or validation failure'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -1709,6 +1902,11 @@ paths:
       operationId: postAdminPropertiesVerification
       tags: [Admin – Properties]
       summary: Verify and publish, or send back to draft
+      description: |
+        Super Admin or a user with `can_verify_properties`. Every property must
+        pass this step before students can see it (D-06). Until open question
+        PV-1 is decided, a verifier may not approve a property they are the
+        assigned broker for (Super Admin may approve any).
       parameters:
         - { $ref: '#/components/parameters/PropertyId' }
       requestBody:
@@ -1757,11 +1955,13 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Settings' }
 
-  /admin/brokerage-rules:
+  /admin/brokerage-policies:
     get:
-      operationId: getAdminBrokerageRules
+      operationId: getAdminBrokeragePolicies
       tags: [Admin – Configuration]
-      summary: Brokerage rules
+      summary: Brokerage policies (active and history)
+      parameters:
+        - { name: active, in: query, schema: { type: boolean } }
       responses:
         '200':
           description: OK
@@ -1770,41 +1970,190 @@ paths:
               schema:
                 type: object
                 properties:
-                  data: { type: array, items: { $ref: '#/components/schemas/BrokerageRule' } }
+                  data: { type: array, items: { $ref: '#/components/schemas/BrokeragePolicy' } }
     post:
-      operationId: postAdminBrokerageRules
+      operationId: postAdminBrokeragePolicies
       tags: [Admin – Configuration]
-      summary: Create a rule
+      summary: Create a policy (to change one, create a new one with `replaces_policy_id`)
+      description: Policies are never edited in place, so every past brokerage can be traced to the exact policy used.
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/BrokerageRule' }
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/BrokeragePolicy'
+                - type: object
+                  properties:
+                    replaces_policy_id: { type: string, format: uuid, description: Deactivated in the same transaction }
       responses:
         '201':
           description: Created
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/BrokerageRule' }
+              schema: { $ref: '#/components/schemas/BrokeragePolicy' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
 
-  /admin/brokerage-rules/{ruleId}:
-    patch:
-      operationId: patchAdminBrokerageRulesById
+  /admin/brokerage-policies/{policyId}/deactivate:
+    post:
+      operationId: postAdminBrokeragePoliciesDeactivate
       tags: [Admin – Configuration]
-      summary: Update or deactivate a rule (existing brokerages keep their snapshot)
+      summary: Deactivate a policy (existing brokerages keep their snapshot)
       parameters:
-        - { name: ruleId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: policyId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Deactivated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokeragePolicy' }
+
+  /admin/brokerages/{brokerageId}/waive:
+    post:
+      operationId: postAdminBrokeragesWaive
+      tags: [Admin – Brokerage]
+      summary: Waive a party's outstanding brokerage (reason required, audited)
+      description: Super Admin only until open question BR-2 (who may waive, and whether partial waivers exist) is decided.
+      parameters:
+        - { name: brokerageId, in: path, required: true, schema: { type: string, format: uuid } }
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/BrokerageRule' }
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 3 }
+      responses:
+        '200':
+          description: Waived
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Brokerage' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  /admin/brokerages/{brokerageId}/refunds:
+    post:
+      operationId: postAdminBrokeragesRefunds
+      tags: [Admin – Brokerage]
+      summary: Start a refund of brokerage already paid (status → refund_pending)
+      description: When refunds apply and who approves them is open question BR-3. Amount ≤ paid − already refunded.
+      parameters:
+        - { name: brokerageId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, reason]
+              properties:
+                amount: { $ref: '#/components/schemas/Money' }
+                reason: { type: string }
+      responses:
+        '201':
+          description: Refund pending
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Refund' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /admin/refunds/{refundId}/complete:
+    post:
+      operationId: postAdminRefundsComplete
+      tags: [Admin – Brokerage]
+      summary: Record that the refund was paid out (status → refunded when nothing else is pending)
+      parameters:
+        - { name: refundId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [method, processed_at]
+              properties:
+                method: { type: string, enum: [upi, cash, bank_transfer] }
+                reference: { type: string, description: Required unless cash }
+                processed_at: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Completed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Refund' }
+
+  /admin/refunds/{refundId}/cancel:
+    post:
+      operationId: postAdminRefundsCancel
+      tags: [Admin – Brokerage]
+      summary: Cancel a pending refund
+      parameters:
+        - { name: refundId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Refund' }
+
+  /admin/brokerages/{brokerageId}/credit:
+    post:
+      operationId: postAdminBrokeragesCredit
+      tags: [Admin – Brokerage]
+      summary: Change which broker is credited (Super Admin override, reason required)
+      description: Lead reassignment never changes credit; this is the only way it changes. Each change is kept in `credit_history`.
+      parameters:
+        - { name: brokerageId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [broker_id, reason]
+              properties:
+                broker_id: { type: string, format: uuid }
+                reason: { type: string, minLength: 3 }
+      responses:
+        '200':
+          description: Credit changed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Brokerage' }
+
+  /admin/users/{userId}/permissions:
+    patch:
+      operationId: patchAdminUsersPermissions
+      tags: [Admin – Brokers]
+      summary: Grant or remove verifier / brokerage-override permissions (audited)
+      parameters:
+        - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                can_verify_properties: { type: boolean }
+                can_override_brokerage: { type: boolean }
       responses:
         '200':
           description: Updated
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/BrokerageRule' }
+              schema: { $ref: '#/components/schemas/Me' }
 
   /admin/lookups/{kind}:
     post:
@@ -1956,7 +2305,8 @@ components:
           type: string
           enum: [VALIDATION_FAILED, UNAUTHENTICATED, OTP_INVALID, SESSION_EXPIRED, FORBIDDEN, NOT_FOUND,
                  RATE_LIMITED, DUPLICATE_ACTIVE_LEAD, BED_NOT_AVAILABLE, PROPERTY_NOT_AVAILABLE,
-                 INVALID_STATUS_TRANSITION, LEAD_NOT_OFFERED_TO_YOU, PUBLISH_VALIDATION_FAILED, OVERPAYMENT]
+                 INVALID_STATUS_TRANSITION, LEAD_NOT_OFFERED_TO_YOU, PUBLISH_VALIDATION_FAILED, OVERPAYMENT,
+                 BROKERAGE_NOT_DISCLOSED, BROKERAGE_NOT_PAYABLE]
         detail: { type: string }
         errors:
           type: object
@@ -1990,7 +2340,9 @@ components:
     VisitStatus: { type: string, enum: [requested, proposed, confirmed, rescheduled, completed, cancelled, no_show] }
     AssignmentStatus: { type: string, enum: [draft, pending_confirmation, reserved, confirmed, cancelled, completed] }
     BedStatus: { type: string, enum: [available, reserved, occupied, maintenance, blocked] }
-    BrokerageStatus: { type: string, enum: [pending, partially_paid, paid, cancelled] }
+    BrokerageStatus: { type: string, enum: [pending, partially_paid, paid, waived, cancelled, refund_pending, refunded] }
+    Party: { type: string, enum: [student, owner] }
+    CalcType: { type: string, enum: [flat, percent_of_monthly_rent, months_of_rent] }
     DocumentType: { type: string, enum: [college_id, government_id, agreement, receipt, owner_document, other] }
 
     Me:
@@ -2003,6 +2355,12 @@ components:
         phone: { $ref: '#/components/schemas/Phone' }
         email: { type: [string, 'null'], format: email }
         profile_complete: { type: boolean }
+        permissions:
+          type: object
+          description: Extra permissions beyond the role (Super Admin has all).
+          properties:
+            can_verify_properties: { type: boolean }
+            can_override_brokerage: { type: boolean }
 
     Area:
       type: object
@@ -2221,6 +2579,12 @@ components:
           oneOf:
             - { $ref: '#/components/schemas/StudentBrokerContact' }
             - { type: 'null' }
+          description: Null until a broker has accepted the lead (D-07). Never the owner.
+        brokerage:
+          oneOf:
+            - { $ref: '#/components/schemas/StudentBrokerage' }
+            - { type: 'null' }
+          description: The student's own brokerage only (never the owner's), once disclosed.
         timeline:
           type: array
           items:
@@ -2352,11 +2716,16 @@ components:
           properties:
             student:
               type: object
-              description: Phone is included only once the lead is accepted (Q-A2).
+              description: |
+                Before the calling broker has ACCEPTED the lead, `phone` and
+                `email` are null (decision D-14), and so are student documents.
+                After acceptance they are returned so the broker can handle
+                the enquiry. Every contact reveal is audited (`lead.contact_viewed`).
               properties:
                 id: { type: string, format: uuid }
                 name: { type: string }
                 phone: { type: [string, 'null'] }
+                email: { type: [string, 'null'] }
                 college: { type: [string, 'null'] }
                 course: { type: [string, 'null'] }
                 year_of_study: { type: [integer, 'null'] }
@@ -2613,19 +2982,85 @@ components:
         vacated_at: { type: [string, 'null'], format: date-time }
         brokerages: { type: array, items: { $ref: '#/components/schemas/Brokerage' } }
 
-    BrokerageRule:
+    BrokeragePolicy:
       type: object
-      required: [name, calc_type, value, payer]
+      required: [name, payer_mode]
+      description: |
+        Who pays (student / owner / both) and each paying party's own
+        calculation. `value` meaning: flat = INR; percent_of_monthly_rent =
+        0–100; months_of_rent = number of months (≥ 1).
       properties:
         id: { type: string, format: uuid, readOnly: true }
         name: { type: string }
-        calc_type: { type: string, enum: [flat, percent_of_monthly_rent, months_of_rent] }
-        value: { $ref: '#/components/schemas/Money' }
-        payer: { type: string, enum: [student, owner] }
-        area_id: { type: [string, 'null'], format: uuid }
+        area_id: { type: [string, 'null'], format: uuid, description: null = any area }
         property_type: { oneOf: [{ $ref: '#/components/schemas/PropertyType' }, { type: 'null' }] }
-        priority: { type: integer }
-        is_active: { type: boolean }
+        priority: { type: integer, default: 0 }
+        payer_mode: { type: string, enum: [student, owner, both] }
+        student: { oneOf: [{ $ref: '#/components/schemas/BrokerageCalc' }, { type: 'null' }], description: Required when payer_mode is student or both }
+        owner: { oneOf: [{ $ref: '#/components/schemas/BrokerageCalc' }, { type: 'null' }], description: Required when payer_mode is owner or both }
+        is_active: { type: boolean, readOnly: true }
+        created_at: { type: string, format: date-time, readOnly: true }
+        deactivated_at: { type: [string, 'null'], format: date-time, readOnly: true }
+
+    BrokerageCalc:
+      type: object
+      required: [calc_type, value]
+      properties:
+        calc_type: { $ref: '#/components/schemas/CalcType' }
+        value: { $ref: '#/components/schemas/Money' }
+
+    BrokerageOverrideCreate:
+      type: object
+      required: [party, calc_type, reason]
+      properties:
+        party: { $ref: '#/components/schemas/Party' }
+        calc_type: { type: string, enum: [flat, percent_of_monthly_rent, months_of_rent, not_charged] }
+        value: { $ref: '#/components/schemas/Money' }
+        reason: { type: string, minLength: 3 }
+    BrokerageOverride:
+      allOf:
+        - $ref: '#/components/schemas/BrokerageOverrideCreate'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            level: { type: string, enum: [property, assignment] }
+            property_id: { type: [string, 'null'], format: uuid }
+            assignment_id: { type: [string, 'null'], format: uuid }
+            created_by: { type: string, format: uuid }
+            created_at: { type: string, format: date-time }
+            revoked_at: { type: [string, 'null'], format: date-time }
+            revoked_by: { type: [string, 'null'], format: uuid }
+            revoke_reason: { type: [string, 'null'] }
+
+    BrokerageQuote:
+      type: object
+      properties:
+        assignment_id: { type: string, format: uuid }
+        rent_base: { $ref: '#/components/schemas/Money' }
+        lines:
+          type: array
+          description: One per charged party
+          items:
+            type: object
+            properties:
+              party: { $ref: '#/components/schemas/Party' }
+              source: { type: string, enum: [policy, property_override, assignment_override] }
+              policy_id: { type: [string, 'null'], format: uuid }
+              override_id: { type: [string, 'null'], format: uuid }
+              calc_type: { $ref: '#/components/schemas/CalcType' }
+              value: { $ref: '#/components/schemas/Money' }
+              amount: { $ref: '#/components/schemas/Money' }
+              explanation: { type: string, example: '1 month of rent (₹8,000)' }
+              disclosure:
+                type: [object, 'null']
+                description: Latest disclosure for this party; `matches_quote` false means it must be shown again
+                properties:
+                  method: { type: string }
+                  amount: { $ref: '#/components/schemas/Money' }
+                  disclosed_at: { type: string, format: date-time }
+                  acknowledged_at: { type: [string, 'null'], format: date-time }
+                  matches_quote: { type: boolean }
+        ready_to_confirm: { type: boolean, description: Every charged party has a matching disclosure }
 
     Brokerage:
       type: object
@@ -2635,14 +3070,53 @@ components:
         assignment_code: { type: string }
         student_name: { type: string }
         property_code: { type: string }
-        payer: { type: string, enum: [student, owner] }
+        party: { $ref: '#/components/schemas/Party' }
+        source: { type: string, enum: [policy, property_override, assignment_override] }
+        calc_snapshot: { type: object }
         amount: { $ref: '#/components/schemas/Money' }
         paid_amount: { $ref: '#/components/schemas/Money' }
+        refunded_amount: { $ref: '#/components/schemas/Money' }
         balance: { $ref: '#/components/schemas/Money' }
         status: { $ref: '#/components/schemas/BrokerageStatus' }
         due_date: { type: [string, 'null'], format: date }
-        rule_snapshot: { type: object }
+        waived_reason: { type: [string, 'null'] }
+        cancel_reason: { type: [string, 'null'] }
+        credited_broker: { type: object, properties: { id: { type: string, format: uuid }, name: { type: string } } }
+        credit_history:
+          type: array
+          items:
+            type: object
+            properties:
+              previous_broker_id: { type: [string, 'null'], format: uuid }
+              new_broker_id: { type: string, format: uuid }
+              reason: { type: string }
+              authorized_by: { type: [string, 'null'], format: uuid }
+              at: { type: string, format: date-time }
         payments: { type: array, items: { $ref: '#/components/schemas/Payment' } }
+        refunds: { type: array, items: { $ref: '#/components/schemas/Refund' } }
+
+    Refund:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        brokerage_id: { type: string, format: uuid }
+        amount: { $ref: '#/components/schemas/Money' }
+        status: { type: string, enum: [pending, completed, cancelled] }
+        reason: { type: string }
+        method: { type: [string, 'null'], enum: [upi, cash, bank_transfer, null] }
+        reference: { type: [string, 'null'] }
+        requested_at: { type: string, format: date-time }
+        processed_at: { type: [string, 'null'], format: date-time }
+
+    StudentBrokerage:
+      type: object
+      additionalProperties: false
+      properties:
+        amount: { $ref: '#/components/schemas/Money' }
+        explanation: { type: string, example: '1 month of rent (₹8,000)' }
+        status: { $ref: '#/components/schemas/BrokerageStatus' }
+        paid_amount: { $ref: '#/components/schemas/Money' }
+        acknowledged: { type: boolean }
 
     PaymentCreate:
       type: object
@@ -2659,7 +3133,7 @@ components:
         id: { type: string, format: uuid }
         brokerage_id: { type: string, format: uuid }
         amount: { $ref: '#/components/schemas/Money' }
-        method: { type: string, enum: [upi, cash, bank_transfer, online_gateway] }
+        method: { type: string, enum: [upi, cash, bank_transfer], description: 'MVP: manual only (D-08)' }
         reference: { type: [string, 'null'] }
         received_at: { type: string, format: date-time }
         receipt_number: { type: string, example: RC-2026-000123 }
@@ -2709,15 +3183,19 @@ components:
             unassigned_escalation_minutes: { type: integer, default: 60 }
             max_auto_offers_per_lead: { type: integer, default: 5 }
             default_max_active_leads: { type: integer, default: 40 }
-        contact:
-          type: object
-          properties:
-            broker_visibility: { type: string, enum: [after_acceptance, always, never], default: after_acceptance }
         marketplace:
           type: object
+          description: Login is always required (D-02) and broker contact is shown only after acceptance (D-07); these are fixed rules, not settings.
           properties:
-            require_login: { type: boolean, default: false }
             approx_location_radius_m: { type: integer, default: 500 }
+        brokerage:
+          type: object
+          properties:
+            credit_policy:
+              type: string
+              enum: [assignment_broker]
+              default: assignment_broker
+              description: 'Credit goes to the broker responsible for the confirmed assignment (D-15). Other policies: open question BR-7.'
         assignments:
           type: object
           properties:

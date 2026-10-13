@@ -1,6 +1,6 @@
 # Data Model
 
-Status: **Draft v0.1**. The DDL in `db/schema.sql` is the source of truth;
+Status: **Draft v0.2** (brokerage model per D-04/D-15). The DDL in `db/schema.sql` is the source of truth;
 this document explains it. Rule tests: `db/tests/schema_rules_test.sql`.
 
 ## 1. Entity overview
@@ -24,8 +24,13 @@ leads ─┬─ lead_status_history
        ├─ lead_assignments   (broker allocation history)
        ├─ follow_ups
        ├─ visits
-       └─ assignments (bed-level) ── brokerages ── payments
-                                      └─ brokerage_rules
+       └─ assignments (bed-level)
+              ├─ brokerage_disclosures      (amount shown to each party)
+              └─ brokerages (one per paying party) ─┬─ payments
+                                                    ├─ brokerage_refunds
+                                                    └─ brokerage_credit_changes
+brokerage_policies (scope → payer + per-party calc)
+brokerage_overrides (property- or assignment-level, per party)
 
 documents (polymorphic: student/owner/property/assignment/payment)
 notifications · audit_logs · system_settings · otp_challenges · user_sessions
@@ -41,7 +46,7 @@ notifications · audit_logs · system_settings · otp_challenges · user_session
 | Lookups | `areas`, `colleges`, `amenities`, `system_settings` |
 | Inventory | `properties`, `property_private_details`, `property_amenities`, `property_college_distances`, `property_photos`, `rooms`, `beds`, `rent_history` |
 | CRM | `shortlists`, `leads`, `lead_status_history`, `lead_assignments`, `follow_ups`, `visits` |
-| Commercial | `assignments`, `brokerage_rules`, `brokerages`, `payments` |
+| Commercial | `assignments`, `brokerage_policies`, `brokerage_overrides`, `brokerage_disclosures`, `brokerages`, `brokerage_credit_changes`, `payments`, `brokerage_refunds` |
 | Platform | `documents`, `notifications`, `audit_logs` |
 | Student read model | views `student_property_listings`, `student_room_availability` |
 
@@ -128,7 +133,9 @@ is set and the bed becomes `available` again.
 `fully_occupied`, `unavailable`, `archived`. Students see `published` and
 `partially_occupied`.
 
-**Brokerage**: `pending`, `partially_paid`, `paid`, `cancelled`.
+**Brokerage** (per party): `pending`, `partially_paid`, `paid`, `waived`,
+`cancelled`, `refund_pending`, `refunded`. **Refund**: `pending`,
+`completed`, `cancelled`.
 **Payment**: `recorded`, `voided` (a payment is voided, never deleted).
 
 ## 6. Integrity rules enforced by the database
@@ -139,7 +146,11 @@ is set and the bed becomes `available` again.
 | One live assignment per bed | unique partial index `assignments_one_live_per_bed` |
 | Allocation fields consistent (offered ⇒ broker + deadline, unassigned ⇒ queued) | CHECK constraints on `leads` |
 | Manual reassignment has an actor and a reason | CHECK on `lead_assignments` |
-| One brokerage per assignment per payer; paid ≤ amount | UNIQUE + CHECK on `brokerages` |
+| One brokerage per assignment per party; refunded ≤ paid ≤ amount; `paid` only when fully paid; waive/cancel need a reason | UNIQUE + CHECKs on `brokerages` |
+| Policy: paying parties have a calculation, others none; % ≤ 100; months ≥ 1 | CHECKs on `brokerage_policies` |
+| Override: reason required; one active per party per level; revocation needs a reason | CHECK + partial unique indexes on `brokerage_overrides` |
+| Credit change after the initial credit needs an authorizer | CHECK on `brokerage_credit_changes` |
+| MVP payment methods are manual only | CHECK on `payments.method` |
 | Non-cash payments carry a reference; voids carry a reason | CHECK on `payments` |
 | Public photos must be privacy-checked | CHECK on `property_photos` |
 | Snoozed follow-ups need a reason | CHECK on `follow_ups` |
@@ -148,8 +159,11 @@ Rules that need the application (each one is a single service method):
 
 - recompute `brokerages.paid_amount` and `status` from non-voided payments;
 - move bed status with the assignment status (table above);
-- create the brokerage record(s) when an assignment is **confirmed**, using
-  the matching `brokerage_rules` row and storing `rule_snapshot`;
+- on **confirmation**: refuse unless every line of `brokerage_quote()` has a
+  disclosure with the same amount; then insert one `brokerages` row per line
+  (with `calc_snapshot` and `credited_broker_id` = the assignment's broker)
+  and the initial `brokerage_credit_changes` row (see `brokerage.md`);
+- recompute `brokerages.status` from payments, refunds, waivers;
 - every active lead has at least one open `follow_up` (also checked by a
   nightly report).
 
@@ -158,7 +172,8 @@ Rules that need the application (each one is a single service method):
 When an assignment is confirmed, `rent_snapshot`, `deposit_snapshot` and
 `maintenance_snapshot` are copied from the room's price **effective on the
 move-in date** (from `rent_history`). They never change afterwards. Brokerage
-amounts are calculated from the snapshot, never from the current room price.
+amounts are calculated from the snapshot (`brokerage_quote()`), never from
+the current room price.
 
 ## 8. Documents and DPDP
 
@@ -177,6 +192,6 @@ amounts are calculated from the snapshot, never from the current room price.
 ## 9. Not yet modelled (deliberately deferred)
 
 - Owner portal permissions (`owners.user_id` is reserved for it).
-- Online payment gateway webhooks (`payments.method = 'online_gateway'` is
-  reserved).
+- Online payment collection (MVP is manual, D-08; `online_gateway` will be
+  added to `payments.method` by migration).
 - Multi-city / multi-tenant brokerages.

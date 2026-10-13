@@ -181,6 +181,152 @@ BEGIN
   END;
 END $$;
 
+-- ------------------------------------------------------- brokerage quote --
+-- Assignment AS-1: property PR-1 (area North Campus, type pg), rent 8000.
+DO $$
+DECLARE asg uuid; adm uuid := '00000000-0000-0000-0000-0000000000a1';
+        q record; n int; pol_specific uuid;
+BEGIN
+  SELECT id INTO asg FROM assignments WHERE code = 'AS-1';
+
+  ASSERT NOT EXISTS (SELECT 1 FROM brokerage_quote(asg)), 'no policy -> nothing charged';
+
+  -- Global policy: student pays 1 month's rent.
+  INSERT INTO brokerage_policies (name, payer_mode, student_calc_type, student_value, created_by)
+  VALUES ('Default', 'student', 'months_of_rent', 1, adm);
+  SELECT count(*) INTO n FROM brokerage_quote(asg);
+  SELECT * INTO q FROM brokerage_quote(asg) WHERE party = 'student';
+  ASSERT n = 1 AND q.amount = 8000 AND q.source = 'policy', 'global policy: student pays 1 month';
+
+  -- Same priority, more specific (area + type): both pay, calculated independently.
+  INSERT INTO brokerage_policies (name, area_id, property_type, payer_mode,
+                                  student_calc_type, student_value, owner_calc_type, owner_value, created_by)
+  VALUES ('North PGs', '00000000-0000-0000-0000-00000000aa01', 'pg', 'both',
+          'percent_of_monthly_rent', 50, 'flat', 2500, adm)
+  RETURNING id INTO pol_specific;
+  SELECT * INTO q FROM brokerage_quote(asg) WHERE party = 'student';
+  ASSERT q.amount = 4000 AND q.policy_id = pol_specific, 'specific policy wins: student 50% of rent';
+  SELECT * INTO q FROM brokerage_quote(asg) WHERE party = 'owner';
+  ASSERT q.amount = 2500, 'specific policy: owner flat 2500';
+
+  -- Higher priority beats specificity.
+  INSERT INTO brokerage_policies (name, priority, payer_mode, owner_calc_type, owner_value, created_by)
+  VALUES ('Promo', 10, 'owner', 'flat', 1000, adm);
+  SELECT count(*) INTO n FROM brokerage_quote(asg);
+  SELECT * INTO q FROM brokerage_quote(asg);
+  ASSERT n = 1 AND q.party = 'owner' AND q.amount = 1000, 'higher priority policy wins';
+  UPDATE brokerage_policies SET is_active = FALSE, deactivated_at = now() WHERE name = 'Promo';
+
+  -- Property-level override: student not charged at this property.
+  INSERT INTO brokerage_overrides (level, property_id, party, calc_type, reason, created_by)
+  VALUES ('property', '00000000-0000-0000-0000-00000000dd01', 'student', 'not_charged', 'Owner-paid property', adm);
+  SELECT count(*) INTO n FROM brokerage_quote(asg);
+  ASSERT n = 1 AND NOT EXISTS (SELECT 1 FROM brokerage_quote(asg) WHERE party = 'student'),
+         'property override removes the student charge';
+
+  -- Assignment-level override beats property-level override.
+  INSERT INTO brokerage_overrides (level, assignment_id, party, calc_type, value, reason, created_by)
+  VALUES ('assignment', asg, 'student', 'flat', 3000, 'Negotiated discount', adm);
+  SELECT * INTO q FROM brokerage_quote(asg) WHERE party = 'student';
+  ASSERT q.amount = 3000 AND q.source = 'assignment_override', 'assignment override wins';
+
+  -- Revoking the assignment override falls back to the property override.
+  UPDATE brokerage_overrides SET revoked_at = now(), revoked_by = adm, revoke_reason = 'Entered by mistake'
+  WHERE level = 'assignment';
+  ASSERT NOT EXISTS (SELECT 1 FROM brokerage_quote(asg) WHERE party = 'student'), 'revoked override no longer applies';
+
+  -- Overrides need a reason; one active override per party and level.
+  BEGIN
+    INSERT INTO brokerage_overrides (level, assignment_id, party, calc_type, value, reason, created_by)
+    VALUES ('assignment', asg, 'owner', 'flat', 1, ' ', adm);
+    RAISE EXCEPTION 'override without reason was allowed';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN
+    INSERT INTO brokerage_overrides (level, property_id, party, calc_type, reason, created_by)
+    VALUES ('property', '00000000-0000-0000-0000-00000000dd01', 'student', 'not_charged', 'again', adm);
+    RAISE EXCEPTION 'two active overrides for one party were allowed';
+  EXCEPTION WHEN unique_violation THEN NULL;
+  END;
+
+  -- Policy validation.
+  BEGIN
+    INSERT INTO brokerage_policies (name, payer_mode, student_calc_type, student_value, created_by)
+    VALUES ('Bad', 'both', 'flat', 100, adm);
+    RAISE EXCEPTION 'payer both without owner calculation was allowed';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN
+    INSERT INTO brokerage_policies (name, payer_mode, student_calc_type, student_value, created_by)
+    VALUES ('Bad', 'student', 'percent_of_monthly_rent', 120, adm);
+    RAISE EXCEPTION 'percentage above 100 was allowed';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN
+    INSERT INTO brokerage_policies (name, payer_mode, owner_calc_type, owner_value, created_by)
+    VALUES ('Bad', 'owner', 'months_of_rent', 0.5, adm);
+    RAISE EXCEPTION 'less than one month of rent was allowed';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+END $$;
+
+-- ------------------------------------------- brokerage records and credit --
+DO $$
+DECLARE asg uuid; adm uuid := '00000000-0000-0000-0000-0000000000a1';
+        b1 uuid := '00000000-0000-0000-0000-0000000000b1'; b2 uuid := '00000000-0000-0000-0000-0000000000b2';
+        brk uuid; pol uuid;
+BEGIN
+  SELECT id INTO asg FROM assignments WHERE code = 'AS-1';
+  SELECT id INTO pol FROM brokerage_policies WHERE name = 'North PGs';
+
+  INSERT INTO brokerages (assignment_id, party, source, policy_id, calc_snapshot, amount, credited_broker_id)
+  VALUES (asg, 'owner', 'policy', pol, '{}', 2500, b1) RETURNING id INTO brk;
+
+  BEGIN
+    UPDATE brokerages SET status = 'waived' WHERE id = brk;
+    RAISE EXCEPTION 'waiver without reason was allowed';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN
+    UPDATE brokerages SET status = 'paid', paid_amount = 1000 WHERE id = brk;
+    RAISE EXCEPTION 'paid status with balance outstanding was allowed';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN
+    UPDATE brokerages SET paid_amount = 1000, refunded_amount = 1500 WHERE id = brk;
+    RAISE EXCEPTION 'refund above paid amount was allowed';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+
+  -- Initial credit is recorded by the system; a later change needs an authorizer.
+  INSERT INTO brokerage_credit_changes (brokerage_id, new_broker_id, reason)
+  VALUES (brk, b1, 'Broker on confirmed assignment');
+  BEGIN
+    INSERT INTO brokerage_credit_changes (brokerage_id, previous_broker_id, new_broker_id, reason)
+    VALUES (brk, b1, b2, 'move');
+    RAISE EXCEPTION 'unauthorized credit change was allowed';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+
+  -- Reassigning the lead does not change brokerage credit.
+  UPDATE leads SET broker_id = b2, allocation_status = 'accepted', queued_at = NULL WHERE code = 'LD-D3';
+  ASSERT (SELECT credited_broker_id FROM brokerages WHERE id = brk) = b1, 'lead reassignment changed credit';
+
+  -- MVP: no online payment collection.
+  BEGIN
+    INSERT INTO payments (brokerage_id, amount, method, reference, received_at, receipt_number, recorded_by)
+    VALUES (brk, 100, 'online_gateway', 'x', now(), 'RC-T1', adm);
+    RAISE EXCEPTION 'online gateway payment was allowed';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN
+    INSERT INTO payments (brokerage_id, amount, method, received_at, receipt_number, recorded_by)
+    VALUES (brk, 100, 'upi', now(), 'RC-T2', adm);
+    RAISE EXCEPTION 'UPI payment without reference was allowed';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+END $$;
+
 -- ------------------------------------------------------ student-safe view --
 DO $$
 DECLARE cols text;

@@ -12,11 +12,16 @@ application code yet.
 
 | Path | What it is |
 |---|---|
-| `docs/decisions.md` | Decision log. Overrides the v1.0 PDFs where they differ; lists open questions |
-| `docs/data-model.md` | Entities, privacy boundary, status lists, integrity rules |
+| `docs/requirements.md` | **Product requirements v1.1** (replaces the v1.0 PDF) |
+| `docs/srs.md` | **SRS v1.1**: functional, security and data requirements, acceptance criteria |
+| `docs/workflow.md` | **Workflow v1.1**: end-to-end flows |
+| `docs/ui-ux-spec.md` | **UI/UX spec v1.1**: screens, states, prototype priority |
+| `docs/decisions.md` | Decision log (D-01 … D-17) and **open questions** |
+| `docs/brokerage.md` | Brokerage policy, overrides, disclosure, payment statuses, credit |
 | `docs/broker-allocation.md` | Automatic lead → broker allocation, reassignment, Unassigned Queue |
+| `docs/data-model.md` | Entities, privacy boundary, status lists, integrity rules |
 | `db/schema.sql` | PostgreSQL 16 reference DDL (source of truth until framework migrations exist) |
-| `db/tests/schema_rules_test.sql` | Database-level tests: allocation priority, eligibility, duplicate leads, bed double-booking, student-view privacy |
+| `db/tests/schema_rules_test.sql` | Database-level tests: allocation priority and eligibility, duplicate leads, bed double-booking, brokerage quote/overrides/statuses/credit, student-view privacy |
 | `api/openapi.yaml` | OpenAPI 3.1 contract for the web PWA and admin |
 
 ## Running the schema tests

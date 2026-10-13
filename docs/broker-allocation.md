@@ -1,6 +1,6 @@
 # Automatic Broker Allocation
 
-Status: **Draft v0.1** — implements the "Automatic Lead Assignment" requirement
+Status: **Draft v0.2** — implements the "Automatic Lead Assignment" requirement
 (objective, workflow, eligibility, priority, reassignment, audit and the 8
 acceptance criteria). Schema: `db/schema.sql` (`leads`, `lead_assignments`,
 `brokers`, `broker_unavailability`, `broker_*_authorizations`,
@@ -152,8 +152,9 @@ They move only when:
 | **Manual** reassignment by Super Admin | Allowed at any state; a reason note is required (`method='manual'`, DB CHECK). May exceed capacity. |
 
 The confirmed `assignments` row keeps its own `broker_id` as a historical
-fact. Brokerage credit for a reassigned lead is a business rule still to be
-decided (open question Q-A3).
+fact. **Brokerage credit never follows a lead reassignment** (D-15). It is
+stored on each brokerage record and changes only by a Super Admin credit
+override (`brokerage.md` §6).
 
 ## 7. Configuration (Super Admin → Settings)
 
@@ -200,8 +201,16 @@ time.
 | 7 | No duplicate active leads | unique partial index `leads_one_active_per_student_property` | same |
 | 8 | Confirmed assignments not silently reassigned | sweeper only touches `allocation_status='offered'`; §6.3 | API test (build phase) |
 
-## 10. Open questions
+## 10. Related decisions
 
-- **Q-A1** Should *Shortlist* also create a (low-priority) lead? Proposed: **no**. Only *Request Visit* and *I'm Interested* create leads.
-- **Q-A2** Should brokers see a lead's student details before accepting it? Proposed: name, college, budget and the property only; phone number after acceptance.
-- **Q-A3** If a lead is reassigned after visits have happened, who gets brokerage credit? Proposed: the broker on the confirmed assignment, with manual split by Super Admin if needed.
+- **D-16** Shortlist never creates a lead. *Request Visit* and *I'm
+  Interested* do.
+- **D-14** Before acceptance a broker sees the student's name, college,
+  course/year, budget and requested property, but no phone, email or
+  documents. After acceptance the contact details are returned, and each
+  reveal is audited (`lead.contact_viewed`).
+- **D-07** The student sees the broker's name and business phone only
+  after acceptance. If the lead is later reassigned, the student sees the
+  new broker once that broker accepts.
+- **D-15** Brokerage credit follows the confirmed assignment, never the
+  reassignment. Splitting credit is open (BR-8).

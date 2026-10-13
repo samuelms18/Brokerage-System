@@ -29,6 +29,9 @@ CREATE TABLE users (
     status          TEXT NOT NULL DEFAULT 'active'
                     CHECK (status IN ('active', 'suspended', 'deactivated')),
     receives_ops_alerts BOOLEAN NOT NULL DEFAULT FALSE, -- "operations team" recipients
+    -- Permissions beyond the role (Super Admin always has them):
+    can_verify_properties  BOOLEAN NOT NULL DEFAULT FALSE, -- "authorized verifier" (D-06)
+    can_override_brokerage BOOLEAN NOT NULL DEFAULT FALSE, -- property/assignment brokerage overrides (D-04)
     last_login_at   TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -495,47 +498,155 @@ CREATE UNIQUE INDEX assignments_one_live_per_bed
 CREATE INDEX assignments_lead_idx ON assignments (lead_id);
 CREATE INDEX assignments_student_idx ON assignments (student_id);
 
--- Configurable brokerage calculation (open decision #4 in docs/decisions.md).
-CREATE TABLE brokerage_rules (
+-- Brokerage policy (decision D-04). One row decides, for a scope, WHO pays
+-- (student, owner or both) and HOW EACH PARTY's amount is calculated,
+-- independently. Rows are never edited in place: a change inserts a new row
+-- and deactivates the old one, so history is preserved.
+-- Calculation types:
+--   flat                    value = amount in INR
+--   percent_of_monthly_rent value = percentage (0–100) of the monthly rent snapshot
+--   months_of_rent          value = number of months (>= 1) × monthly rent snapshot
+CREATE TABLE brokerage_policies (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name            TEXT NOT NULL,
-    calc_type       TEXT NOT NULL CHECK (calc_type IN ('flat', 'percent_of_monthly_rent', 'months_of_rent')),
-    value           NUMERIC(12,2) NOT NULL CHECK (value >= 0),
-    payer           TEXT NOT NULL CHECK (payer IN ('student', 'owner')),
-    area_id         UUID REFERENCES areas(id),       -- NULL = applies everywhere
+    area_id         UUID REFERENCES areas(id),       -- NULL = any area
     property_type   TEXT,                            -- NULL = any type
-    priority        INTEGER NOT NULL DEFAULT 0,      -- most specific / highest priority wins
+    priority        INTEGER NOT NULL DEFAULT 0,      -- higher wins, then more specific scope
+    payer_mode      TEXT NOT NULL CHECK (payer_mode IN ('student', 'owner', 'both')),
+    student_calc_type TEXT CHECK (student_calc_type IN ('flat', 'percent_of_monthly_rent', 'months_of_rent')),
+    student_value   NUMERIC(12,2),
+    owner_calc_type TEXT CHECK (owner_calc_type IN ('flat', 'percent_of_monthly_rent', 'months_of_rent')),
+    owner_value     NUMERIC(12,2),
     is_active       BOOLEAN NOT NULL DEFAULT TRUE,
     created_by      UUID NOT NULL REFERENCES users(id),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deactivated_at  TIMESTAMPTZ,
+    deactivated_by  UUID REFERENCES users(id),
+    -- the parties that pay have a calculation; the others have none
+    CHECK ((payer_mode IN ('student', 'both')) = (student_calc_type IS NOT NULL AND student_value IS NOT NULL)),
+    CHECK ((payer_mode IN ('student', 'both')) OR (student_calc_type IS NULL AND student_value IS NULL)),
+    CHECK ((payer_mode IN ('owner', 'both')) = (owner_calc_type IS NOT NULL AND owner_value IS NOT NULL)),
+    CHECK ((payer_mode IN ('owner', 'both')) OR (owner_calc_type IS NULL AND owner_value IS NULL)),
+    CHECK (student_value IS NULL OR student_value >= 0),
+    CHECK (owner_value IS NULL OR owner_value >= 0),
+    CHECK (student_calc_type <> 'percent_of_monthly_rent' OR student_value <= 100),
+    CHECK (owner_calc_type <> 'percent_of_monthly_rent' OR owner_value <= 100),
+    CHECK (student_calc_type <> 'months_of_rent' OR student_value >= 1),
+    CHECK (owner_calc_type <> 'months_of_rent' OR owner_value >= 1),
+    CHECK (is_active OR deactivated_at IS NOT NULL)
 );
+CREATE INDEX brokerage_policies_active_idx ON brokerage_policies (priority DESC) WHERE is_active;
 
--- Created automatically when an assignment is confirmed. One per payer.
+-- Property-level or assignment-level override for ONE party. A reason is
+-- mandatory. Rows are never edited: they are revoked (with a reason) and
+-- replaced, so the full history stays. calc_type 'not_charged' means this
+-- party pays nothing at this level.
+-- Who may create overrides: users.can_override_brokerage (+ Super Admin).
+CREATE TABLE brokerage_overrides (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    level           TEXT NOT NULL CHECK (level IN ('property', 'assignment')),
+    property_id     UUID REFERENCES properties(id),
+    assignment_id   UUID REFERENCES assignments(id),
+    party           TEXT NOT NULL CHECK (party IN ('student', 'owner')),
+    calc_type       TEXT NOT NULL CHECK (calc_type IN ('flat', 'percent_of_monthly_rent', 'months_of_rent', 'not_charged')),
+    value           NUMERIC(12,2),
+    reason          TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    created_by      UUID NOT NULL REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at      TIMESTAMPTZ,
+    revoked_by      UUID REFERENCES users(id),
+    revoke_reason   TEXT,
+    CHECK ((level = 'property') = (property_id IS NOT NULL AND assignment_id IS NULL)),
+    CHECK ((level = 'assignment') = (assignment_id IS NOT NULL AND property_id IS NULL)),
+    CHECK ((calc_type = 'not_charged') = (value IS NULL)),
+    CHECK (value IS NULL OR value >= 0),
+    CHECK (calc_type <> 'percent_of_monthly_rent' OR value <= 100),
+    CHECK (calc_type <> 'months_of_rent' OR value >= 1),
+    CHECK (revoked_at IS NULL OR (revoked_by IS NOT NULL AND revoke_reason IS NOT NULL))
+);
+CREATE UNIQUE INDEX brokerage_overrides_one_active_property
+    ON brokerage_overrides (property_id, party) WHERE level = 'property' AND revoked_at IS NULL;
+CREATE UNIQUE INDEX brokerage_overrides_one_active_assignment
+    ON brokerage_overrides (assignment_id, party) WHERE level = 'assignment' AND revoked_at IS NULL;
+
+-- Proof that each paying party was shown the brokerage amount BEFORE the
+-- assignment is confirmed. Confirmation is refused unless every charged
+-- party has a disclosure whose amount equals the current quote; any change
+-- to the quote (e.g. a new override) therefore needs a fresh disclosure.
+CREATE TABLE brokerage_disclosures (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    assignment_id   UUID NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+    party           TEXT NOT NULL CHECK (party IN ('student', 'owner')),
+    amount          NUMERIC(12,2) NOT NULL CHECK (amount >= 0),
+    calc_snapshot   JSONB NOT NULL,                  -- what the party was shown and how it was calculated
+    method          TEXT NOT NULL CHECK (method IN ('in_app', 'whatsapp', 'phone', 'in_person', 'email')),
+    disclosed_by    UUID REFERENCES users(id),       -- NULL = system (in-app)
+    disclosed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    acknowledged_at TIMESTAMPTZ                      -- set if the party acknowledged (see open question BR-6)
+);
+CREATE INDEX brokerage_disclosures_assignment_idx ON brokerage_disclosures (assignment_id, party, disclosed_at DESC);
+
+-- One brokerage record per charged party, created when the assignment is
+-- confirmed, with the calculation frozen. Each party is tracked separately.
 CREATE TABLE brokerages (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     assignment_id   UUID NOT NULL REFERENCES assignments(id),
-    payer           TEXT NOT NULL CHECK (payer IN ('student', 'owner')),
-    rule_id         UUID REFERENCES brokerage_rules(id),
-    rule_snapshot   JSONB NOT NULL,                  -- the rule as applied, for audit
+    party           TEXT NOT NULL CHECK (party IN ('student', 'owner')),
+    source          TEXT NOT NULL CHECK (source IN ('policy', 'property_override', 'assignment_override')),
+    policy_id       UUID REFERENCES brokerage_policies(id),
+    override_id     UUID REFERENCES brokerage_overrides(id),
+    calc_snapshot   JSONB NOT NULL,                  -- calc_type, value, rent base, as applied
     amount          NUMERIC(12,2) NOT NULL CHECK (amount >= 0),
     paid_amount     NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (paid_amount >= 0),
-    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'partially_paid', 'paid', 'cancelled')),
+    refunded_amount NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (refunded_amount >= 0),
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+                        'pending', 'partially_paid', 'paid', 'waived', 'cancelled',
+                        'refund_pending', 'refunded')),
+    -- Brokerage credit (decision D-15): fixed when the record is created,
+    -- changed only by an authorized override (brokerage_credit_changes).
+    -- Reassigning the lead never changes it.
+    credited_broker_id UUID NOT NULL REFERENCES brokers(user_id),
     due_date        DATE,
+    waived_reason   TEXT,
+    waived_by       UUID REFERENCES users(id),
     cancel_reason   TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (assignment_id, payer),
-    CHECK (paid_amount <= amount)
+    UNIQUE (assignment_id, party),
+    CHECK ((source = 'policy') = (policy_id IS NOT NULL AND override_id IS NULL)),
+    CHECK ((source <> 'policy') = (override_id IS NOT NULL)),
+    CHECK (paid_amount <= amount),
+    CHECK (refunded_amount <= paid_amount),
+    CHECK (status <> 'waived' OR (waived_reason IS NOT NULL AND waived_by IS NOT NULL)),
+    CHECK (status <> 'cancelled' OR cancel_reason IS NOT NULL),
+    CHECK (status <> 'paid' OR paid_amount = amount),
+    CHECK (status <> 'refunded' OR refunded_amount > 0)
 );
 CREATE INDEX brokerages_status_idx ON brokerages (status);
+CREATE INDEX brokerages_credited_broker_idx ON brokerages (credited_broker_id, status);
 
--- MVP records payments; it does not collect them online (decision #8).
+-- Every change of brokerage credit. The first row (previous_broker_id NULL,
+-- authorized_by NULL) records the initial credit by the system.
+CREATE TABLE brokerage_credit_changes (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    brokerage_id    UUID NOT NULL REFERENCES brokerages(id) ON DELETE CASCADE,
+    previous_broker_id UUID REFERENCES brokers(user_id),
+    new_broker_id   UUID NOT NULL REFERENCES brokers(user_id),
+    reason          TEXT NOT NULL,
+    authorized_by   UUID REFERENCES users(id),       -- Super Admin; NULL only for the initial system credit
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (previous_broker_id IS NULL OR authorized_by IS NOT NULL)
+);
+CREATE INDEX brokerage_credit_changes_brokerage_idx ON brokerage_credit_changes (brokerage_id, created_at);
+
+-- MVP records payments manually; there is no online collection (decision D-08).
+-- 'online_gateway' will be added by migration when a gateway is integrated.
 CREATE TABLE payments (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     brokerage_id    UUID NOT NULL REFERENCES brokerages(id),
     amount          NUMERIC(12,2) NOT NULL CHECK (amount > 0),
-    method          TEXT NOT NULL CHECK (method IN ('upi', 'cash', 'bank_transfer', 'online_gateway')),
-    reference       TEXT,                            -- UPI ref / UTR / gateway id
+    method          TEXT NOT NULL CHECK (method IN ('upi', 'cash', 'bank_transfer')),
+    reference       TEXT,                            -- UPI ref / UTR
     received_at     TIMESTAMPTZ NOT NULL,
     receipt_number  TEXT NOT NULL UNIQUE,            -- e.g. 'RC-2026-000123'
     status          TEXT NOT NULL DEFAULT 'recorded' CHECK (status IN ('recorded', 'voided')),
@@ -546,6 +657,26 @@ CREATE TABLE payments (
     CHECK (status <> 'voided' OR void_reason IS NOT NULL)
 );
 CREATE INDEX payments_brokerage_idx ON payments (brokerage_id);
+
+-- Refunds of brokerage already paid, recorded manually. When refunds apply,
+-- who approves them and whether partial refunds are allowed are open
+-- questions (BR-3); the table supports partial amounts.
+CREATE TABLE brokerage_refunds (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    brokerage_id    UUID NOT NULL REFERENCES brokerages(id),
+    amount          NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'cancelled')),
+    reason          TEXT NOT NULL,
+    method          TEXT CHECK (method IN ('upi', 'cash', 'bank_transfer')),
+    reference       TEXT,
+    requested_by    UUID NOT NULL REFERENCES users(id),
+    requested_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_by    UUID REFERENCES users(id),
+    processed_at    TIMESTAMPTZ,
+    CHECK (status <> 'completed' OR (processed_by IS NOT NULL AND processed_at IS NOT NULL
+                                     AND method IS NOT NULL AND (method = 'cash' OR reference IS NOT NULL)))
+);
+CREATE INDEX brokerage_refunds_brokerage_idx ON brokerage_refunds (brokerage_id);
 
 -- -----------------------------------------------------------------------------
 -- 7. Documents, notifications, audit
@@ -700,6 +831,81 @@ LANGUAGE sql STABLE AS $$
            OR EXISTS (SELECT 1 FROM broker_area_authorizations x
                       WHERE x.broker_id = b.user_id AND x.area_id = p.area_id))
     ORDER BY tier, active_leads, b.last_assigned_at NULLS FIRST, b.user_id
+$$;
+
+-- -----------------------------------------------------------------------------
+-- 10. Brokerage quote (docs/brokerage.md §3)
+--
+-- The amount each party owes for an assignment, one row per CHARGED party
+-- (a party that is not charged has no row). Used both to show the amount
+-- before confirmation and to create the brokerages rows at confirmation,
+-- so the two can never differ. Resolution per party:
+--   1. active assignment-level override
+--   2. active property-level override
+--   3. the best matching active policy: highest priority, then most specific
+--      scope (area + property type), then newest
+-- Amounts are rounded to 2 decimals; the business rounding rule is open (BR-5).
+-- -----------------------------------------------------------------------------
+
+CREATE FUNCTION brokerage_quote(p_assignment_id UUID)
+RETURNS TABLE (party TEXT, source TEXT, policy_id UUID, override_id UUID,
+               calc_type TEXT, value NUMERIC, rent_base NUMERIC, amount NUMERIC)
+LANGUAGE sql STABLE AS $$
+    WITH a AS (
+        SELECT asg.id, asg.rent_snapshot, p.id AS property_id, p.area_id, p.property_type
+        FROM assignments asg JOIN properties p ON p.id = asg.property_id
+        WHERE asg.id = p_assignment_id
+    ),
+    pol AS (
+        SELECT bp.*
+        FROM brokerage_policies bp, a
+        WHERE bp.is_active
+          AND (bp.area_id IS NULL OR bp.area_id = a.area_id)
+          AND (bp.property_type IS NULL OR bp.property_type = a.property_type)
+        ORDER BY bp.priority DESC,
+                 ((bp.area_id IS NOT NULL)::int + (bp.property_type IS NOT NULL)::int) DESC,
+                 bp.created_at DESC
+        LIMIT 1
+    ),
+    resolved AS (
+        SELECT pt.party,
+               ao.id AS ao_id, po.id AS po_id, pol.id AS pol_id,
+               COALESCE(ao.calc_type, po.calc_type, pc.calc_type) AS calc_type,
+               CASE WHEN ao.id IS NOT NULL THEN ao.value
+                    WHEN po.id IS NOT NULL THEN po.value
+                    ELSE pc.value END AS value,
+               a.rent_snapshot
+        FROM (VALUES ('student'), ('owner')) AS pt(party)
+        CROSS JOIN a
+        LEFT JOIN pol ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT CASE pt.party WHEN 'student' THEN pol.student_calc_type ELSE pol.owner_calc_type END AS calc_type,
+                   CASE pt.party WHEN 'student' THEN pol.student_value     ELSE pol.owner_value     END AS value
+        ) pc ON TRUE
+        LEFT JOIN brokerage_overrides ao
+               ON ao.level = 'assignment' AND ao.assignment_id = a.id
+              AND ao.party = pt.party AND ao.revoked_at IS NULL
+        LEFT JOIN brokerage_overrides po
+               ON po.level = 'property' AND po.property_id = a.property_id
+              AND po.party = pt.party AND po.revoked_at IS NULL
+    )
+    SELECT party,
+           CASE WHEN ao_id IS NOT NULL THEN 'assignment_override'
+                WHEN po_id IS NOT NULL THEN 'property_override'
+                ELSE 'policy' END,
+           CASE WHEN ao_id IS NULL AND po_id IS NULL THEN pol_id END,
+           COALESCE(ao_id, po_id),
+           calc_type,
+           value,
+           rent_snapshot,
+           round(CASE calc_type
+                     WHEN 'flat' THEN value
+                     WHEN 'percent_of_monthly_rent' THEN rent_snapshot * value / 100
+                     WHEN 'months_of_rent' THEN rent_snapshot * value
+                 END, 2)
+    FROM resolved
+    WHERE calc_type IS NOT NULL AND calc_type <> 'not_charged'
+    ORDER BY party DESC   -- student first
 $$;
 
 COMMIT;

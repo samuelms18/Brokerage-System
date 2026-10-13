@@ -150,7 +150,7 @@ export function createBrokerageRecords(a: Assignment, actorId: string, creditedB
   const records = quote(a).map((l): BrokerageRecord => ({
     id: newId("brk"), assignmentId: a.id, party: l.party, source: l.source,
     calcSnapshot: { calcType: l.calcType, value: l.value, rentBase: l.rentBase, explanation: l.explanation },
-    amount: l.amount, paidAmount: 0, status: "pending",
+    amount: l.amount, paidAmount: 0, refundedAmount: 0, status: "pending", waivedReason: null, waivedBy: null,
     creditedBrokerId,
     creditHistory: [{ previousBrokerId: null, newBrokerId: creditedBrokerId, reason: "Broker responsible for the confirmed assignment", authorizedBy: null, at: now }],
     createdAt: now,

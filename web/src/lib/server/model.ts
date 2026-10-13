@@ -17,6 +17,18 @@ export type AllocationStatus = "unassigned" | "offered" | "accepted";
 export type VisitStatus =
   | "requested" | "proposed" | "confirmed" | "rescheduled" | "completed" | "cancelled" | "no_show";
 
+export interface Unavailability {
+  id: string;
+  kind: "leave" | "unavailable";
+  startsAt: number;
+  endsAt: number;
+  reason: string | null;
+  createdBy: string;
+  cancelledAt: number | null;
+}
+
+export const isUnavailableAt = (w: Unavailability, at: number) => w.cancelledAt === null && at >= w.startsAt && at < w.endsAt;
+
 export interface Area { id: string; name: string; city: string }
 export interface College { id: string; name: string; shortName: string; areaId: string }
 export interface Amenity { id: string; name: string; category: string }
@@ -40,7 +52,7 @@ export interface Broker {
   lastAssignedAt: number | null;
   areaIds: string[];
   propertyIds: string[];
-  unavailable: { startsAt: number; endsAt: number }[];
+  unavailable: Unavailability[];
 }
 
 /** PRIVATE */
@@ -81,6 +93,10 @@ export interface Property {
   availableFrom: string | null;
   status: PropertyStatus;
   publishedAt: string;
+  verifiedAt?: number;
+  verifiedBy?: string;
+  /** Note from the verifier when a property is sent back to draft. */
+  verificationNote?: string;
   amenityIds: string[];
   collegeDistances: { collegeId: string; km: number }[];
   photos: Photo[];
@@ -198,7 +214,10 @@ export interface BrokerageRecord {
   calcSnapshot: { calcType: CalcType; value: number; rentBase: number; explanation: string };
   amount: number;
   paidAmount: number;
+  refundedAmount: number;
   status: BrokerageStatus;
+  waivedReason: string | null;
+  waivedBy: string | null;
   creditedBrokerId: string;
   creditHistory: { previousBrokerId: string | null; newBrokerId: string; reason: string; authorizedBy: string | null; at: number }[];
   createdAt: number;
@@ -214,6 +233,20 @@ export interface Payment {
   receiptNumber: string;
   recordedBy: string;
   createdAt: number;
+}
+
+export interface Refund {
+  id: string;
+  brokerageId: string;
+  amount: number;
+  status: "pending" | "completed" | "cancelled";
+  reason: string;
+  method: "upi" | "cash" | "bank_transfer" | null;
+  reference: string | null;
+  requestedBy: string;
+  requestedAt: number;
+  processedBy: string | null;
+  processedAt: number | null;
 }
 
 export interface AuditEntry { at: number; actorId: string | null; action: string; entityType: string; entityId: string; metadata?: Record<string, unknown> }

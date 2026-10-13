@@ -7,7 +7,7 @@ import { sweep } from "@/lib/server/broker";
 export async function requireStudentPage(returnTo: string) {
   const user = await currentUser();
   if (!user) redirect(returnTo === "/" ? "/login" : `/login?next=${encodeURIComponent(returnTo)}`);
-  if (user.role !== "student") redirect("/broker");
+  if (user.role !== "student") redirect(homeFor(user.role));
   sweep();
   return { user, collegeId: store().students.get(user.id)?.collegeId ?? null };
 }
@@ -16,10 +16,21 @@ export async function requireStudentPage(returnTo: string) {
 export async function requireBrokerPage(returnTo: string) {
   const user = await currentUser();
   if (!user) redirect(`/login?next=${encodeURIComponent(returnTo)}`);
-  if (user.role !== "broker" && user.role !== "super_admin") redirect("/");
+  if (user.role !== "broker") redirect(homeFor(user.role));
   sweep();
   return { user, broker: store().brokers.get(user.id) ?? null };
 }
+
+/** Server-component guard for the Super Admin app. */
+export async function requireAdminPage(returnTo: string) {
+  const user = await currentUser();
+  if (!user) redirect(`/login?next=${encodeURIComponent(returnTo)}`);
+  if (user.role !== "super_admin") redirect(homeFor(user.role));
+  sweep();
+  return { user };
+}
+
+export const homeFor = (role: string) => (role === "super_admin" ? "/admin" : role === "broker" ? "/broker" : "/");
 
 export function toSearchParams(sp: Record<string, string | string[] | undefined>): URLSearchParams {
   const out = new URLSearchParams();

@@ -32,7 +32,7 @@ export const amenities: Amenity[] = [
 ];
 
 export const staffUsers: User[] = [
-  { id: "u-admin", role: "super_admin", name: "Platform Admin", phone: "+910000000001", status: "active" },
+  { id: "u-admin", role: "super_admin", name: "Platform Admin", phone: "+919800000001", status: "active" },
   // Asha holds the brokerage-override permission in the demo only (who should have it is open question BR-1).
   { id: "u-broker-asha", role: "broker", name: "Asha Kulkarni", phone: "+919800000011", status: "active", canOverrideBrokerage: true },
   { id: "u-broker-ravi", role: "broker", name: "Ravi Menon", phone: "+919800000012", status: "active" },

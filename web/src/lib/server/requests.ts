@@ -5,7 +5,7 @@
 
 import type { components } from "@/lib/api-types";
 import { audit, newId, store } from "./store";
-import { isActiveLead, type Broker, type Lead, type LeadAssignmentEvent, type Property } from "./model";
+import { isActiveLead, isUnavailableAt, type Broker, type Lead, type LeadAssignmentEvent, type Property } from "./model";
 import { findStudentVisible } from "./listings";
 import { toStudentRequest } from "./student-dto";
 import { latestDisclosure } from "./brokerage";
@@ -41,7 +41,7 @@ export function eligibleBrokers(p: Property, excluded: string[] = [], at = Date.
     if (!b.acceptingLeads) return false;
     if (activeLeadCount(b.userId) >= b.maxActiveLeads) return false;
     if (excluded.includes(b.userId)) return false;
-    if (b.unavailable.some((w) => at >= w.startsAt && at < w.endsAt)) return false;
+    if (b.unavailable.some((w) => isUnavailableAt(w, at))) return false;
     return b.userId === p.brokerId || b.propertyIds.includes(p.id) || b.areaIds.includes(p.areaId);
   });
   const tier = (b: Broker) => (b.userId === p.brokerId ? 1 : 2);

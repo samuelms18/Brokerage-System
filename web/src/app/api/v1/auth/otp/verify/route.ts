@@ -2,11 +2,12 @@ import { AuthError, SESSION_COOKIE, sanitizeReturnTo, verifyOtp } from "@/lib/se
 import { json, problem, readJson } from "@/lib/server/http";
 import { toMe } from "@/lib/server/me";
 
-/** Staff land in the broker app; students never get sent into it. */
+/** Each role lands in its own app and is never sent into another one. */
 function homeFor(role: string, path: string) {
-  const brokerPath = path === "/broker" || path.startsWith("/broker/");
-  if (role === "student") return brokerPath ? "/" : path;
-  return brokerPath ? path : "/broker";
+  const area = (p: string) => path === p || path.startsWith(`${p}/`);
+  if (role === "super_admin") return area("/admin") ? path : "/admin";
+  if (role === "broker") return area("/broker") ? path : "/broker";
+  return area("/broker") || area("/admin") ? "/" : path;
 }
 
 export async function POST(req: Request) {

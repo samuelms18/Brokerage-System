@@ -23,7 +23,7 @@ clickable prototype (`web/`).
 | `db/schema.sql` | PostgreSQL 16 reference DDL (source of truth until framework migrations exist) |
 | `db/tests/schema_rules_test.sql` | Database-level tests: allocation priority and eligibility, duplicate leads, bed double-booking, brokerage quote/overrides/statuses/credit, student-view privacy |
 | `api/openapi.yaml` | OpenAPI 3.1 contract for the web PWA and admin |
-| `web/` | Prototype: student marketplace + broker app (see `web/README.md`) |
+| `web/` | Prototype: student marketplace, broker app, Super Admin (see `web/README.md`) |
 
 ## Running the schema tests
 
@@ -48,6 +48,6 @@ team's confirmation. Flutter is deferred until the product is validated.
 
 ## Next step
 
-Prototype step 3: Super Admin (brokerage policies, verification queue,
-Unassigned Queue, manual reassignment, waivers/refunds/credit overrides,
-audit) and the real backend once the framework is confirmed.
+The prototype covers all three roles. Next: build the real backend
+(Laravel + PostgreSQL by default, once confirmed) behind the same API
+contract, and close the open business questions in `docs/decisions.md`.

@@ -10,7 +10,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
   const { next } = await searchParams;
   const returnTo = sanitizeReturnTo(next);
   const user = await currentUser();
-  if (user) redirect(user.role === "student" ? returnTo : "/broker");
+  if (user) redirect(user.role === "student" ? returnTo : user.role === "super_admin" ? "/admin" : "/broker");
   const fromProperty = returnTo.startsWith("/p/");
 
   return (

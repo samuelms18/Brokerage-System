@@ -3,7 +3,7 @@
 // Data resets when the server restarts.
 
 import * as seed from "./seed";
-import type { Assignment, AuditEntry, Broker, BrokerageDisclosure, BrokerageOverride, BrokeragePolicy, BrokerageRecord, Lead, Owner, Payment, Property, Student, User, Visit } from "./model";
+import type { Refund, Assignment, AuditEntry, Broker, BrokerageDisclosure, BrokerageOverride, BrokeragePolicy, BrokerageRecord, Lead, Owner, Payment, Property, Student, User, Visit } from "./model";
 
 export interface Session { token: string; userId: string; expiresAt: number }
 export interface OtpChallenge { id: string; phone: string; code: string; attempts: number; expiresAt: number; consumed: boolean }
@@ -26,6 +26,7 @@ export interface Store {
   disclosures: BrokerageDisclosure[];
   brokerages: BrokerageRecord[];
   payments: Payment[];
+  refunds: Refund[];
   audit: AuditEntry[];
   seq: { lead: number; assignment: number; receipt: number };
 }
@@ -50,6 +51,7 @@ function fresh(): Store {
     disclosures: [],
     brokerages: [],
     payments: [],
+    refunds: [],
     audit: [],
     seq: { lead: 20480, assignment: 3300, receipt: 0 },
   };

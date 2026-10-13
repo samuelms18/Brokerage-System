@@ -138,5 +138,7 @@ collection rate per party.
 2. **Broker:** Dashboard → Offered lead → Accept → Visit → Assignment with
    brokerage disclosure *(built in `web/`)*
 3. Brokerage ledger / receipt *(ledger and manual payments built; receipt PDF pending)*
+4. **Super Admin:** queue and reassignment, brokers, verification, policies,
+   waivers/refunds/credit, audit *(built in `web/`)*
 
 Validate these before advanced AI or analytics.

@@ -7,12 +7,13 @@ import type { User } from "./model";
 type ProblemCode =
   | "LEAD_NOT_OFFERED_TO_YOU" | "BED_NOT_AVAILABLE" | "DUPLICATE_ACTIVE_LEAD" | "BROKERAGE_NOT_DISCLOSED" | "OVERPAYMENT"
   | "VALIDATION_FAILED" | "UNAUTHENTICATED" | "OTP_INVALID" | "SESSION_EXPIRED" | "FORBIDDEN" | "NOT_FOUND"
-  | "RATE_LIMITED" | "INVALID_STATUS_TRANSITION" | "PROPERTY_NOT_AVAILABLE";
+  | "RATE_LIMITED" | "INVALID_STATUS_TRANSITION" | "PROPERTY_NOT_AVAILABLE" | "PUBLISH_VALIDATION_FAILED";
 
 const STATUS: Record<ProblemCode, number> = {
   VALIDATION_FAILED: 422, UNAUTHENTICATED: 401, OTP_INVALID: 401, SESSION_EXPIRED: 401, FORBIDDEN: 403,
   NOT_FOUND: 404, RATE_LIMITED: 429, INVALID_STATUS_TRANSITION: 409, PROPERTY_NOT_AVAILABLE: 409,
   LEAD_NOT_OFFERED_TO_YOU: 409, BED_NOT_AVAILABLE: 409, DUPLICATE_ACTIVE_LEAD: 409, BROKERAGE_NOT_DISCLOSED: 409, OVERPAYMENT: 422,
+  PUBLISH_VALIDATION_FAILED: 422,
 };
 
 export function problem(code: ProblemCode, title: string, extra: { errors?: Record<string, string[]> } = {}) {
@@ -45,6 +46,14 @@ export async function requireBrokerApi(): Promise<{ user: User } | NextResponse>
   const user = await currentUser();
   if (!user) return problem("UNAUTHENTICATED", "Log in to continue");
   if (user.role !== "broker" && user.role !== "super_admin") return problem("FORBIDDEN", "Broker account required");
+  return { user };
+}
+
+/** Route-handler guard for Super Admin endpoints. */
+export async function requireAdminApi(): Promise<{ user: User } | NextResponse> {
+  const user = await currentUser();
+  if (!user) return problem("UNAUTHENTICATED", "Log in to continue");
+  if (user.role !== "super_admin") return problem("FORBIDDEN", "Super Admin only");
   return { user };
 }
 

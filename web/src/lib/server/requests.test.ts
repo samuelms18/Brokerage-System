@@ -39,7 +39,7 @@ describe("request visit and lead allocation", () => {
   });
 
   it("skips brokers on leave", () => {
-    store().brokers.get("u-broker-asha")!.unavailable.push({ startsAt: Date.now() - 1000, endsAt: Date.now() + 3600_000 });
+    store().brokers.get("u-broker-asha")!.unavailable.push({ id: "u1", kind: "leave", startsAt: Date.now() - 1000, endsAt: Date.now() + 3600_000, reason: null, createdBy: "u-admin", cancelledAt: null });
     const property = store().properties.find((p) => p.code === "PR-1001")!;
     expect(eligibleBrokers(property).map((b) => b.userId)).toEqual(["u-broker-ravi"]);
   });

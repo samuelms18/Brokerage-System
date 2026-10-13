@@ -1,0 +1,2737 @@
+openapi: 3.1.0
+info:
+  title: Student Rental Brokerage Platform API
+  version: 0.1.0-draft
+  description: |
+    API contract for the MVP (web PWA + single backend).
+
+    **Conventions**
+    - Base path `/v1`. JSON everywhere except uploads (multipart).
+    - Auth: `Authorization: Bearer <token>` issued by phone OTP. Role and
+      object-level permissions are enforced on the server for every call.
+    - Errors use `application/problem+json` (`Problem`) with a stable `code`.
+    - List endpoints are paginated with `page` / `per_page` (max 100).
+    - Money is a decimal string in INR (`"8500.00"`) to avoid float rounding.
+    - Mutating student endpoints accept an `Idempotency-Key` header, so a
+      double tap never creates two requests.
+
+    **Privacy contract (non-negotiable)**
+    - Everything under `/listings` and `/student` returns only the `Student*`
+      schemas. They have `additionalProperties: false` and contain no
+      owner, exact-address, exact-coordinate or internal-user fields.
+      Contract tests must fail the build if a response carries anything else.
+    - Owner data and exact addresses appear only in `PropertyPrivate`, served
+      under `/broker` and `/admin` to authorized users. Each read is audited.
+
+    **Roles**: `student`, `broker`, `super_admin` (`owner` reserved).
+    `super_admin` may call every `/broker` endpoint.
+
+    **Broker object access**: a broker can read and act on leads currently
+    assigned to them, and on properties they are the assigned broker for or
+    authorized for (property or area). Anything else returns 404, not 403,
+    so the existence of other records isn't revealed.
+servers:
+  - url: https://api.example.com/v1
+    description: Production (placeholder)
+  - url: http://localhost:8000/v1
+    description: Local
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Auth
+  - name: Marketplace
+    description: Public, student-safe property browsing.
+  - name: Student – Profile
+  - name: Student – Shortlist
+  - name: Student – Requests
+    description: Visit requests / interest. Triggers automatic broker allocation.
+  - name: Documents
+  - name: Notifications
+  - name: Broker – Dashboard
+  - name: Broker – Leads
+  - name: Broker – Properties
+  - name: Broker – Rooms & Beds
+  - name: Broker – Visits
+  - name: Broker – Assignments
+  - name: Broker – Brokerage
+  - name: Admin – Brokers
+  - name: Admin – Allocation
+  - name: Admin – Properties
+  - name: Admin – Configuration
+  - name: Admin – Audit & Reports
+
+paths:
+  # ============================================================== AUTH ====
+  /auth/otp/request:
+    post:
+      operationId: postAuthOtpRequest
+      tags: [Auth]
+      summary: Send an OTP to a phone number
+      description: Rate limited per phone and per IP. The response is the same whether or not the phone is registered.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: { $ref: '#/components/schemas/Phone' }
+      responses:
+        '202':
+          description: OTP sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [challenge_id, expires_in_seconds, resend_after_seconds]
+                properties:
+                  challenge_id: { type: string, format: uuid }
+                  expires_in_seconds: { type: integer, example: 300 }
+                  resend_after_seconds: { type: integer, example: 30 }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/otp/verify:
+    post:
+      operationId: postAuthOtpVerify
+      tags: [Auth]
+      summary: Verify OTP and sign in (creates a student account on first login)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challenge_id, code]
+              properties:
+                challenge_id: { type: string, format: uuid }
+                code: { type: string, pattern: '^[0-9]{6}$' }
+                name: { type: string, description: Required on first login. }
+      responses:
+        '200':
+          description: Signed in
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, expires_at, user]
+                properties:
+                  access_token: { type: string }
+                  expires_at: { type: string, format: date-time }
+                  user: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/logout:
+    post:
+      operationId: postAuthLogout
+      tags: [Auth]
+      summary: Revoke the current session
+      responses:
+        '204': { description: Signed out }
+
+  /me:
+    get:
+      operationId: getMe
+      tags: [Auth]
+      summary: Current user
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  # ======================================================= MARKETPLACE ====
+  /listings:
+    get:
+      operationId: getListings
+      tags: [Marketplace]
+      summary: Search student-visible properties
+      description: Public by default (decision D-02). Reads only the student read model.
+      security: [{}, { bearerAuth: [] }]
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: 'Property title, area, college or landmark text' }
+        - { name: area_id, in: query, schema: { type: array, items: { type: string, format: uuid } }, style: form, explode: true }
+        - { name: college_id, in: query, schema: { type: string, format: uuid } }
+        - { name: max_distance_km, in: query, schema: { type: number }, description: Requires college_id }
+        - { name: rent_min, in: query, schema: { type: integer } }
+        - { name: rent_max, in: query, schema: { type: integer } }
+        - { name: deposit_max, in: query, schema: { type: integer } }
+        - { name: sharing, in: query, schema: { type: array, items: { type: integer, minimum: 1 } }, style: form, explode: true }
+        - { name: property_type, in: query, schema: { type: array, items: { $ref: '#/components/schemas/PropertyType' } }, style: form, explode: true }
+        - { name: gender, in: query, schema: { type: string, enum: [male, female, any] } }
+        - { name: amenity_id, in: query, schema: { type: array, items: { type: string, format: uuid } }, style: form, explode: true }
+        - { name: food_included, in: query, schema: { type: boolean } }
+        - { name: available_by, in: query, schema: { type: string, format: date } }
+        - { name: sort, in: query, schema: { type: string, enum: [recommended, rent_asc, nearest, newest], default: recommended }, description: '`nearest` requires college_id' }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: Results
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/StudentListingCard' } }
+                  meta:
+                    allOf:
+                      - $ref: '#/components/schemas/PageMeta'
+                      - type: object
+                        properties:
+                          suggestions:
+                            type: array
+                            description: Filter relaxations offered when there are no results (e.g. "raise budget to ₹9,000").
+                            items:
+                              type: object
+                              properties:
+                                label: { type: string }
+                                query: { type: object, additionalProperties: true }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /listings/{code}:
+    get:
+      operationId: getListingsById
+      tags: [Marketplace]
+      summary: Property detail (student-safe)
+      security: [{}, { bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PropertyCode' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StudentListingDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /lookups:
+    get:
+      operationId: getLookups
+      tags: [Marketplace]
+      summary: Areas, colleges and amenities for filters and forms
+      security: [{}, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  areas: { type: array, items: { $ref: '#/components/schemas/Area' } }
+                  colleges: { type: array, items: { $ref: '#/components/schemas/College' } }
+                  amenities: { type: array, items: { $ref: '#/components/schemas/Amenity' } }
+
+  # ==================================================== STUDENT ==========
+  /student/profile:
+    get:
+      operationId: getStudentProfile
+      tags: [Student – Profile]
+      summary: Get my profile
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StudentProfile' }
+    patch:
+      operationId: patchStudentProfile
+      tags: [Student – Profile]
+      summary: Update my profile and preferences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StudentProfileUpdate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StudentProfile' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /student/shortlist:
+    get:
+      operationId: getStudentShortlist
+      tags: [Student – Shortlist]
+      summary: My shortlisted properties
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/StudentListingCard' } }
+
+  /student/shortlist/{code}:
+    parameters:
+      - { $ref: '#/components/parameters/PropertyCode' }
+    put:
+      operationId: putStudentShortlistById
+      tags: [Student – Shortlist]
+      summary: Add to shortlist (idempotent; does not create a lead)
+      responses:
+        '204': { description: Shortlisted }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteStudentShortlistById
+      tags: [Student – Shortlist]
+      summary: Remove from shortlist
+      responses:
+        '204': { description: Removed }
+
+  /student/requests:
+    post:
+      operationId: postStudentRequests
+      tags: [Student – Requests]
+      summary: Request a visit or express interest
+      description: |
+        Runs the automatic allocation flow (docs/broker-allocation.md §5):
+        1. If an active lead exists for this student and property, it is
+           reused. The visit request or interest is attached; no new lead
+           is created and allocation does not run again.
+        2. Otherwise a lead is created and offered to the best eligible
+           broker, or placed in the Unassigned Queue.
+
+        **The response is identical in every case.** It never reveals the
+        broker, the allocation outcome, or whether the lead already existed.
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StudentRequestCreate' }
+      responses:
+        '202':
+          description: Request received
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestReceived' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`PROPERTY_NOT_AVAILABLE`: the property was unpublished or is fully occupied.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    get:
+      operationId: getStudentRequests
+      tags: [Student – Requests]
+      summary: Track my requests
+      parameters:
+        - { name: state, in: query, schema: { type: string, enum: [open, closed, all], default: open } }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/StudentRequest' } }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+
+  /student/requests/{requestId}:
+    parameters:
+      - { name: requestId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      operationId: getStudentRequestsById
+      tags: [Student – Requests]
+      summary: Request detail and timeline
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StudentRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /student/requests/{requestId}/cancel:
+    post:
+      operationId: postStudentRequestsCancel
+      tags: [Student – Requests]
+      summary: Withdraw my request (lead → student_cancelled)
+      parameters:
+        - { name: requestId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StudentRequest' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  /student/visits/{visitId}/confirm:
+    post:
+      operationId: postStudentVisitsConfirm
+      tags: [Student – Requests]
+      summary: Accept the time the broker proposed
+      parameters:
+        - { $ref: '#/components/parameters/VisitId' }
+      responses:
+        '200':
+          description: Confirmed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StudentVisit' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  /student/visits/{visitId}/cancel:
+    post:
+      operationId: postStudentVisitsCancel
+      tags: [Student – Requests]
+      summary: Cancel a visit
+      parameters:
+        - { $ref: '#/components/parameters/VisitId' }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StudentVisit' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  # ==================================================== DOCUMENTS ========
+  /documents:
+    post:
+      operationId: postDocuments
+      tags: [Documents]
+      summary: Upload a document
+      description: |
+        Students may upload only for themselves (`subject_type=student`).
+        Brokers may upload for subjects they can access. Validated by MIME
+        type sniffing, size (≤ 10 MB) and extension allow-list
+        (pdf, jpg, png, webp).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, subject_type, subject_id, doc_type, purpose]
+              properties:
+                file: { type: string, format: binary }
+                subject_type: { type: string, enum: [student, owner, property, assignment, payment] }
+                subject_id: { type: string, format: uuid }
+                doc_type: { $ref: '#/components/schemas/DocumentType' }
+                purpose: { type: string, maxLength: 200 }
+      responses:
+        '201':
+          description: Uploaded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '413': { description: File too large }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    get:
+      operationId: getDocuments
+      tags: [Documents]
+      summary: List documents for a subject I can access
+      parameters:
+        - { name: subject_type, in: query, required: true, schema: { type: string, enum: [student, owner, property, assignment, payment] } }
+        - { name: subject_id, in: query, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Document' } }
+
+  /documents/{documentId}/download-url:
+    get:
+      operationId: getDocumentsDownloadUrl
+      tags: [Documents]
+      summary: Get a short-lived signed download URL (audited)
+      parameters:
+        - { name: documentId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url, expires_at]
+                properties:
+                  url: { type: string, format: uri }
+                  expires_at: { type: string, format: date-time }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ================================================ NOTIFICATIONS ========
+  /notifications:
+    get:
+      operationId: getNotifications
+      tags: [Notifications]
+      summary: My notifications
+      parameters:
+        - { name: unread_only, in: query, schema: { type: boolean, default: false } }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Notification' } }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+
+  /notifications/{notificationId}/read:
+    post:
+      operationId: postNotificationsRead
+      tags: [Notifications]
+      summary: Mark as read
+      parameters:
+        - { name: notificationId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204': { description: Marked }
+
+  # ================================================ BROKER: DASHBOARD ====
+  /broker/dashboard:
+    get:
+      operationId: getBrokerDashboard
+      tags: [Broker – Dashboard]
+      summary: KPI counts; each one deep-links to a filtered list
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerDashboard' }
+
+  /broker/availability:
+    get:
+      operationId: getBrokerAvailability
+      tags: [Broker – Dashboard]
+      summary: My availability for new leads
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerAvailability' }
+    put:
+      operationId: putBrokerAvailability
+      tags: [Broker – Dashboard]
+      summary: Turn receiving new leads on or off
+      description: Turning it off reassigns my offered (not yet accepted) leads automatically. Accepted leads stay with me.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [accepting_leads]
+              properties:
+                accepting_leads: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerAvailability' }
+
+  /broker/unavailability:
+    post:
+      operationId: postBrokerUnavailability
+      tags: [Broker – Dashboard]
+      summary: Schedule my leave / unavailable window
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UnavailabilityCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Unavailability' }
+
+  # ==================================================== BROKER: LEADS ====
+  /broker/leads:
+    get:
+      operationId: getBrokerLeads
+      tags: [Broker – Leads]
+      summary: My leads
+      parameters:
+        - { name: status, in: query, schema: { type: array, items: { $ref: '#/components/schemas/LeadStatus' } }, style: form, explode: true }
+        - { name: allocation_status, in: query, schema: { $ref: '#/components/schemas/AllocationStatus' } }
+        - { name: follow_up, in: query, schema: { type: string, enum: [overdue, today, upcoming] } }
+        - { name: active, in: query, schema: { type: boolean, default: true } }
+        - { name: q, in: query, schema: { type: string }, description: 'Student name/phone, lead code, property code' }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/LeadSummary' } }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+    post:
+      operationId: postBrokerLeads
+      tags: [Broker – Leads]
+      summary: Create a lead manually (walk-in / phone)
+      description: The lead is assigned to the calling broker and starts as `accepted`. If the student is new, an account is created from their phone number.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LeadCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeadDetail' }
+        '409': { $ref: '#/components/responses/DuplicateActiveLead' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /broker/leads/{leadId}:
+    parameters:
+      - { $ref: '#/components/parameters/LeadId' }
+    get:
+      operationId: getBrokerLeadsById
+      tags: [Broker – Leads]
+      summary: Lead detail (student, requirements, visits, timeline)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeadDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: patchBrokerLeadsById
+      tags: [Broker – Leads]
+      summary: Update requirements / notes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                requirements: { $ref: '#/components/schemas/LeadRequirements' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeadDetail' }
+
+  /broker/leads/{leadId}/accept:
+    post:
+      operationId: postBrokerLeadsAccept
+      tags: [Broker – Leads]
+      summary: Accept an offered lead
+      parameters:
+        - { $ref: '#/components/parameters/LeadId' }
+      responses:
+        '200':
+          description: Accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeadDetail' }
+        '409':
+          description: '`LEAD_NOT_OFFERED_TO_YOU`: the offer expired and the lead was reassigned.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /broker/leads/{leadId}/decline:
+    post:
+      operationId: postBrokerLeadsDecline
+      tags: [Broker – Leads]
+      summary: Decline an offered lead (reassigned automatically)
+      parameters:
+        - { $ref: '#/components/parameters/LeadId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '204': { description: Declined }
+        '409':
+          description: '`LEAD_NOT_OFFERED_TO_YOU`'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /broker/leads/{leadId}/status:
+    post:
+      operationId: postBrokerLeadsStatus
+      tags: [Broker – Leads]
+      summary: Move the lead to another status
+      description: |
+        Server validates the transition. Moving to a non-terminal status
+        requires a `next_action` (every open lead has a next action). Terminal
+        statuses require `reason`. Implicitly accepts an offered lead.
+      parameters:
+        - { $ref: '#/components/parameters/LeadId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_status]
+              properties:
+                to_status: { $ref: '#/components/schemas/LeadStatus' }
+                reason: { type: string, maxLength: 500 }
+                next_action: { $ref: '#/components/schemas/FollowUpCreate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeadDetail' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /broker/leads/{leadId}/matches:
+    get:
+      operationId: getBrokerLeadsMatches
+      tags: [Broker – Leads]
+      summary: Suggested properties for this lead's requirements
+      parameters:
+        - { $ref: '#/components/parameters/LeadId' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/PropertySummary'
+                        - type: object
+                          properties:
+                            match_score: { type: integer, minimum: 0, maximum: 100 }
+                            match_reasons: { type: array, items: { type: string } }
+
+  /broker/leads/{leadId}/follow-ups:
+    post:
+      operationId: postBrokerLeadsFollowUps
+      tags: [Broker – Leads]
+      summary: Add a follow-up
+      parameters:
+        - { $ref: '#/components/parameters/LeadId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FollowUpCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FollowUp' }
+
+  /broker/follow-ups/{followUpId}:
+    patch:
+      operationId: patchBrokerFollowUpsById
+      tags: [Broker – Leads]
+      summary: Complete or snooze a follow-up
+      description: Completing the last open follow-up on an active lead requires a `next_action`.
+      parameters:
+        - { name: followUpId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [status]
+                  properties:
+                    status: { const: done }
+                    next_action: { $ref: '#/components/schemas/FollowUpCreate' }
+                - type: object
+                  required: [status, due_at, snooze_reason]
+                  properties:
+                    status: { const: snoozed }
+                    due_at: { type: string, format: date-time }
+                    snooze_reason: { type: string }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FollowUp' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # =============================================== BROKER: PROPERTIES ====
+  /broker/properties:
+    get:
+      operationId: getBrokerProperties
+      tags: [Broker – Properties]
+      summary: Properties I can access
+      parameters:
+        - { name: status, in: query, schema: { type: array, items: { $ref: '#/components/schemas/PropertyStatus' } }, style: form, explode: true }
+        - { name: area_id, in: query, schema: { type: string, format: uuid } }
+        - { name: q, in: query, schema: { type: string } }
+        - { name: mine_only, in: query, schema: { type: boolean, default: false } }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/PropertySummary' } }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+    post:
+      operationId: postBrokerProperties
+      tags: [Broker – Properties]
+      summary: Create a property (status draft) with its private owner/address details
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [listing, private]
+              properties:
+                listing: { $ref: '#/components/schemas/PropertyListingInput' }
+                private: { $ref: '#/components/schemas/PropertyPrivateInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PropertyDetail' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /broker/properties/{propertyId}:
+    parameters:
+      - { $ref: '#/components/parameters/PropertyId' }
+    get:
+      operationId: getBrokerPropertiesById
+      tags: [Broker – Properties]
+      summary: Property detail including the private owner panel (audited)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PropertyDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: patchBrokerPropertiesById
+      tags: [Broker – Properties]
+      summary: Update public listing fields
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PropertyListingInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PropertyDetail' }
+
+  /broker/properties/{propertyId}/private:
+    put:
+      operationId: putBrokerPropertiesPrivate
+      tags: [Broker – Properties]
+      summary: Replace private details (owner link, exact address, exact pin)
+      description: Saving a new exact pin recomputes the fixed approximate location and the college distances.
+      parameters:
+        - { $ref: '#/components/parameters/PropertyId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PropertyPrivateInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PropertyPrivate' }
+
+  /broker/properties/{propertyId}/submit-for-verification:
+    post:
+      operationId: postBrokerPropertiesSubmitForVerification
+      tags: [Broker – Properties]
+      summary: Move draft → verification
+      description: Fails with `PUBLISH_VALIDATION_FAILED` and a list of missing items (e.g. no public photo, no rooms, no price).
+      parameters:
+        - { $ref: '#/components/parameters/PropertyId' }
+      responses:
+        '200':
+          description: Submitted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PropertyDetail' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /broker/properties/{propertyId}/status:
+    post:
+      operationId: postBrokerPropertiesStatus
+      tags: [Broker – Properties]
+      summary: Mark unavailable / archive / restore
+      description: Marking unavailable closes active leads as `property_unavailable`, notifies those students and suggests similar properties.
+      parameters:
+        - { $ref: '#/components/parameters/PropertyId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_status]
+              properties:
+                to_status: { type: string, enum: [unavailable, archived, published] }
+                reason: { type: string }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PropertyDetail' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  /broker/properties/{propertyId}/photos:
+    post:
+      operationId: postBrokerPropertiesPhotos
+      tags: [Broker – Properties]
+      summary: Upload a photo (private until privacy-checked and made public)
+      parameters:
+        - { $ref: '#/components/parameters/PropertyId' }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                room_id: { type: string, format: uuid }
+                caption: { type: string }
+      responses:
+        '201':
+          description: Uploaded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Photo' }
+
+  /broker/photos/{photoId}:
+    patch:
+      operationId: patchBrokerPhotosById
+      tags: [Broker – Properties]
+      summary: Edit caption / order / privacy check / public flag
+      description: '`is_public: true` requires `privacy_checked: true` (no house number, signboard or owner visible).'
+      parameters:
+        - { name: photoId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                caption: { type: string }
+                sort_order: { type: integer }
+                privacy_checked: { type: boolean }
+                is_public: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Photo' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      operationId: deleteBrokerPhotosById
+      tags: [Broker – Properties]
+      summary: Delete a photo
+      parameters:
+        - { name: photoId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204': { description: Deleted }
+
+  /broker/properties/{propertyId}/share-message:
+    get:
+      operationId: getBrokerPropertiesShareMessage
+      tags: [Broker – Properties]
+      summary: WhatsApp-safe share text and link
+      description: Built only from student-safe fields. Never contains owner contact or exact address.
+      parameters:
+        - { $ref: '#/components/parameters/PropertyId' }
+        - { name: lead_id, in: query, schema: { type: string, format: uuid }, description: Optional; tags the link so a resulting request is attributed to this lead/broker }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [text, listing_url, whatsapp_url]
+                properties:
+                  text: { type: string }
+                  listing_url: { type: string, format: uri }
+                  whatsapp_url: { type: string, format: uri, description: 'wa.me deep link with the text pre-filled' }
+
+  /broker/owners:
+    get:
+      operationId: getBrokerOwners
+      tags: [Broker – Properties]
+      summary: Search owners (to link to a property)
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 3 }, description: Name or phone }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Owner' } }
+    post:
+      operationId: postBrokerOwners
+      tags: [Broker – Properties]
+      summary: Create an owner record
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OwnerInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Owner' }
+
+  # =========================================== BROKER: ROOMS & BEDS ======
+  /broker/properties/{propertyId}/rooms:
+    get:
+      operationId: getBrokerPropertiesRooms
+      tags: [Broker – Rooms & Beds]
+      summary: Room manager (rooms with beds)
+      parameters:
+        - { $ref: '#/components/parameters/PropertyId' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Room' } }
+    post:
+      operationId: postBrokerPropertiesRooms
+      tags: [Broker – Rooms & Beds]
+      summary: Add a room (beds auto-created from `sharing` unless `beds` given)
+      parameters:
+        - { $ref: '#/components/parameters/PropertyId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RoomCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Room' }
+
+  /broker/rooms/{roomId}:
+    patch:
+      operationId: patchBrokerRoomsById
+      tags: [Broker – Rooms & Beds]
+      summary: Update room attributes / status (prices change via rent-changes)
+      parameters:
+        - { $ref: '#/components/parameters/RoomId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label: { type: string }
+                room_type: { type: string, enum: [ac, non_ac] }
+                attached_bathroom: { type: boolean }
+                status: { type: string, enum: [active, maintenance, blocked] }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Room' }
+
+  /broker/rooms/{roomId}/rent-changes:
+    post:
+      operationId: postBrokerRoomsRentChanges
+      tags: [Broker – Rooms & Beds]
+      summary: Schedule a price change with an effective date
+      description: Existing assignments keep their snapshot. A change effective today updates the current price immediately.
+      parameters:
+        - { $ref: '#/components/parameters/RoomId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rent_per_bed, deposit_per_bed, effective_from]
+              properties:
+                rent_per_bed: { $ref: '#/components/schemas/Money' }
+                deposit_per_bed: { $ref: '#/components/schemas/Money' }
+                maintenance_per_bed: { $ref: '#/components/schemas/Money' }
+                effective_from: { type: string, format: date }
+                reason: { type: string }
+      responses:
+        '201': { description: Scheduled }
+        '409': { description: A change already exists for that date }
+
+  /broker/rooms/{roomId}/beds:
+    post:
+      operationId: postBrokerRoomsBeds
+      tags: [Broker – Rooms & Beds]
+      summary: Add a bed
+      parameters:
+        - { $ref: '#/components/parameters/RoomId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [label]
+              properties:
+                label: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bed' }
+
+  /broker/beds/{bedId}:
+    patch:
+      operationId: patchBrokerBedsById
+      tags: [Broker – Rooms & Beds]
+      summary: Set a bed to maintenance / blocked / available
+      description: '`reserved` and `occupied` are set only through assignments.'
+      parameters:
+        - { name: bedId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label: { type: string }
+                status: { type: string, enum: [available, maintenance, blocked] }
+                available_from: { type: [string, 'null'], format: date }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bed' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  # ================================================ BROKER: VISITS =======
+  /broker/visits:
+    get:
+      operationId: getBrokerVisits
+      tags: [Broker – Visits]
+      summary: Visit calendar
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date } }
+        - { name: status, in: query, schema: { type: array, items: { $ref: '#/components/schemas/VisitStatus' } }, style: form, explode: true }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Visit' } }
+
+  /broker/leads/{leadId}/visits:
+    post:
+      operationId: postBrokerLeadsVisits
+      tags: [Broker – Visits]
+      summary: Schedule a visit for a lead (broker-initiated)
+      parameters:
+        - { $ref: '#/components/parameters/LeadId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [property_id, scheduled_at]
+              properties:
+                property_id: { type: string, format: uuid }
+                scheduled_at: { type: string, format: date-time }
+                note: { type: string }
+      responses:
+        '201':
+          description: Created (status proposed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Visit' }
+
+  /broker/visits/{visitId}/propose:
+    post:
+      operationId: postBrokerVisitsPropose
+      tags: [Broker – Visits]
+      summary: Propose or reschedule a time
+      parameters:
+        - { $ref: '#/components/parameters/VisitId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scheduled_at]
+              properties:
+                scheduled_at: { type: string, format: date-time }
+                note: { type: string }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Visit' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  /broker/visits/{visitId}/outcome:
+    post:
+      operationId: postBrokerVisitsOutcome
+      tags: [Broker – Visits]
+      summary: Record the result (completed with outcome, no-show, or cancelled)
+      parameters:
+        - { $ref: '#/components/parameters/VisitId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [completed, no_show, cancelled] }
+                outcome: { type: string, enum: [interested, not_interested, wants_more_options, negotiating], description: Required when completed }
+                note: { type: string }
+                next_action: { $ref: '#/components/schemas/FollowUpCreate' }
+      responses:
+        '200':
+          description: Recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Visit' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # =========================================== BROKER: ASSIGNMENTS =======
+  /broker/assignments:
+    get:
+      operationId: getBrokerAssignments
+      tags: [Broker – Assignments]
+      summary: Assignments
+      parameters:
+        - { name: status, in: query, schema: { type: array, items: { $ref: '#/components/schemas/AssignmentStatus' } }, style: form, explode: true }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Assignment' } }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+    post:
+      operationId: postBrokerAssignments
+      tags: [Broker – Assignments]
+      summary: Start an assignment for a lead on a specific bed
+      description: |
+        Checks availability and locks the bed row. `hold: true` creates the
+        assignment as `reserved` (bed → reserved until `reserved_until`);
+        otherwise it is `draft`. The commercial snapshot is previewed now
+        and frozen at confirmation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignmentCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Assignment' }
+        '409': { $ref: '#/components/responses/BedNotAvailable' }
+
+  /broker/assignments/{assignmentId}:
+    get:
+      operationId: getBrokerAssignmentsById
+      tags: [Broker – Assignments]
+      summary: Assignment detail
+      parameters:
+        - { $ref: '#/components/parameters/AssignmentId' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Assignment' }
+
+  /broker/assignments/{assignmentId}/transition:
+    post:
+      operationId: postBrokerAssignmentsTransition
+      tags: [Broker – Assignments]
+      summary: Move an assignment through its lifecycle
+      description: |
+        - `pending_confirmation` / `reserved` → bed reserved.
+        - `confirmed` → freezes the snapshot, bed → occupied, lead → `assigned`,
+          and **creates the brokerage record(s)** from the matching rule.
+        - `completed` (move-in) → requires `moved_in_at`; lead → `move_in_complete`
+          once the brokerage is paid.
+        - `cancelled` → bed → available; any unpaid brokerage → cancelled.
+      parameters:
+        - { $ref: '#/components/parameters/AssignmentId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_status]
+              properties:
+                to_status: { type: string, enum: [pending_confirmation, reserved, confirmed, completed, cancelled] }
+                reserved_until: { type: string, format: date-time }
+                owner_confirmed: { type: boolean }
+                moved_in_at: { type: string, format: date-time }
+                reason: { type: string }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Assignment' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  /broker/assignments/{assignmentId}/vacate:
+    post:
+      operationId: postBrokerAssignmentsVacate
+      tags: [Broker – Assignments]
+      summary: Record that the tenant moved out (bed → available)
+      parameters:
+        - { $ref: '#/components/parameters/AssignmentId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [vacated_at]
+              properties:
+                vacated_at: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Assignment' }
+
+  # ============================================= BROKER: BROKERAGE =======
+  /broker/brokerages:
+    get:
+      operationId: getBrokerBrokerages
+      tags: [Broker – Brokerage]
+      summary: Brokerage ledger
+      parameters:
+        - { name: status, in: query, schema: { type: array, items: { $ref: '#/components/schemas/BrokerageStatus' } }, style: form, explode: true }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Brokerage' } }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+
+  /broker/brokerages/{brokerageId}/payments:
+    post:
+      operationId: postBrokerBrokeragesPayments
+      tags: [Broker – Brokerage]
+      summary: Record a payment and issue a receipt
+      parameters:
+        - { name: brokerageId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentCreate' }
+      responses:
+        '201':
+          description: Recorded; brokerage paid_amount/status updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '422':
+          description: '`OVERPAYMENT` or validation failure'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /broker/payments/{paymentId}/void:
+    post:
+      operationId: postBrokerPaymentsVoid
+      tags: [Broker – Brokerage]
+      summary: Void a payment (never deleted)
+      parameters:
+        - { name: paymentId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: Voided
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+
+  /broker/payments/{paymentId}/receipt:
+    get:
+      operationId: getBrokerPaymentsReceipt
+      tags: [Broker – Brokerage]
+      summary: Receipt PDF
+      parameters:
+        - { name: paymentId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: PDF
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+
+  # ================================================= ADMIN: BROKERS ======
+  /admin/brokers:
+    get:
+      operationId: getAdminBrokers
+      tags: [Admin – Brokers]
+      summary: Brokers with live availability and load
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/BrokerAdminView' } }
+    post:
+      operationId: postAdminBrokers
+      tags: [Admin – Brokers]
+      summary: Create a broker account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, phone, display_name]
+              properties:
+                name: { type: string }
+                phone: { $ref: '#/components/schemas/Phone' }
+                email: { type: string, format: email }
+                display_name: { type: string }
+                business_name: { type: string }
+                business_phone: { $ref: '#/components/schemas/Phone' }
+                max_active_leads: { type: integer, minimum: 0 }
+                area_ids: { type: array, items: { type: string, format: uuid } }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerAdminView' }
+
+  /admin/brokers/{brokerId}:
+    patch:
+      operationId: patchAdminBrokersById
+      tags: [Admin – Brokers]
+      summary: Update capacity, availability, account status
+      description: Setting `status` to `deactivated` applies the explicit reassignment rule (docs/broker-allocation.md §6.3).
+      parameters:
+        - { $ref: '#/components/parameters/BrokerId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                business_phone: { $ref: '#/components/schemas/Phone' }
+                max_active_leads: { type: integer, minimum: 0 }
+                accepting_leads: { type: boolean }
+                status: { type: string, enum: [active, suspended, deactivated] }
+                receives_ops_alerts: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerAdminView' }
+
+  /admin/brokers/{brokerId}/authorizations:
+    put:
+      operationId: putAdminBrokersAuthorizations
+      tags: [Admin – Brokers]
+      summary: Replace the broker's area and property authorizations
+      parameters:
+        - { $ref: '#/components/parameters/BrokerId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [area_ids, property_ids]
+              properties:
+                area_ids: { type: array, items: { type: string, format: uuid } }
+                property_ids: { type: array, items: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerAdminView' }
+
+  /admin/brokers/{brokerId}/unavailability:
+    post:
+      operationId: postAdminBrokersUnavailability
+      tags: [Admin – Brokers]
+      summary: Mark a broker on leave / unavailable for a window
+      parameters:
+        - { $ref: '#/components/parameters/BrokerId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UnavailabilityCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Unavailability' }
+
+  /admin/unavailability/{unavailabilityId}/cancel:
+    post:
+      operationId: postAdminUnavailabilityCancel
+      tags: [Admin – Brokers]
+      summary: Cancel a leave / unavailable window (brokers may cancel their own)
+      parameters:
+        - { name: unavailabilityId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204': { description: Cancelled }
+
+  # ============================================== ADMIN: ALLOCATION ======
+  /admin/leads/unassigned:
+    get:
+      operationId: getAdminLeadsUnassigned
+      tags: [Admin – Allocation]
+      summary: Unassigned Queue (oldest first)
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/LeadSummary' } }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+
+  /admin/allocation/exceptions:
+    get:
+      operationId: getAdminAllocationExceptions
+      tags: [Admin – Allocation]
+      summary: Leads needing manual handling
+      description: Deactivated brokers' leads with confirmed assignments, leads that hit `max_auto_offers_per_lead`, and queued leads past the escalation threshold.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        lead: { $ref: '#/components/schemas/LeadSummary' }
+                        exception: { type: string, enum: [broker_deactivated_with_assignment, max_offers_reached, queue_escalation] }
+                        since: { type: string, format: date-time }
+
+  /admin/leads/{leadId}/reassign:
+    post:
+      operationId: postAdminLeadsReassign
+      tags: [Admin – Allocation]
+      summary: Manually reassign a lead (exceptions only)
+      description: Works in any allocation state. May exceed capacity. A reason is mandatory. Notifies the previous and new brokers.
+      parameters:
+        - { $ref: '#/components/parameters/LeadId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [broker_id, reason_note]
+              properties:
+                broker_id: { type: string, format: uuid }
+                reason_note: { type: string, minLength: 5 }
+                mark_accepted: { type: boolean, default: true, description: false = offer with a response window }
+      responses:
+        '200':
+          description: Reassigned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeadDetail' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /admin/leads/{leadId}/assignment-history:
+    get:
+      operationId: getAdminLeadsAssignmentHistory
+      tags: [Admin – Allocation]
+      summary: Full allocation history of a lead
+      parameters:
+        - { $ref: '#/components/parameters/LeadId' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/LeadAssignmentEvent' } }
+
+  # ============================================== ADMIN: PROPERTIES ======
+  /admin/properties/{propertyId}/verification:
+    post:
+      operationId: postAdminPropertiesVerification
+      tags: [Admin – Properties]
+      summary: Verify and publish, or send back to draft
+      parameters:
+        - { $ref: '#/components/parameters/PropertyId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [publish, reject] }
+                note: { type: string, description: Required when rejecting }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PropertyDetail' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  # =========================================== ADMIN: CONFIGURATION ======
+  /admin/settings:
+    get:
+      operationId: getAdminSettings
+      tags: [Admin – Configuration]
+      summary: System settings
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Settings' }
+    patch:
+      operationId: patchAdminSettings
+      tags: [Admin – Configuration]
+      summary: Update settings (audited)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Settings' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Settings' }
+
+  /admin/brokerage-rules:
+    get:
+      operationId: getAdminBrokerageRules
+      tags: [Admin – Configuration]
+      summary: Brokerage rules
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/BrokerageRule' } }
+    post:
+      operationId: postAdminBrokerageRules
+      tags: [Admin – Configuration]
+      summary: Create a rule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BrokerageRule' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerageRule' }
+
+  /admin/brokerage-rules/{ruleId}:
+    patch:
+      operationId: patchAdminBrokerageRulesById
+      tags: [Admin – Configuration]
+      summary: Update or deactivate a rule (existing brokerages keep their snapshot)
+      parameters:
+        - { name: ruleId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BrokerageRule' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BrokerageRule' }
+
+  /admin/lookups/{kind}:
+    post:
+      operationId: postAdminLookupsById
+      tags: [Admin – Configuration]
+      summary: Add an area, college or amenity
+      parameters:
+        - { name: kind, in: path, required: true, schema: { type: string, enum: [areas, colleges, amenities] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Area'
+                - $ref: '#/components/schemas/College'
+                - $ref: '#/components/schemas/Amenity'
+      responses:
+        '201': { description: Created }
+
+  # ========================================== ADMIN: AUDIT & REPORTS =====
+  /admin/audit-logs:
+    get:
+      operationId: getAdminAuditLogs
+      tags: [Admin – Audit & Reports]
+      summary: Audit log search
+      parameters:
+        - { name: entity_type, in: query, schema: { type: string } }
+        - { name: entity_id, in: query, schema: { type: string, format: uuid } }
+        - { name: actor_id, in: query, schema: { type: string, format: uuid } }
+        - { name: action, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/AuditLog' } }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+
+  /admin/reports/{report}:
+    get:
+      operationId: getAdminReportsById
+      tags: [Admin – Audit & Reports]
+      summary: Reports (JSON, or CSV with Accept text/csv)
+      parameters:
+        - name: report
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [availability, lead-funnel, visit-conversion, broker-performance, brokerage-summary, demand, property-performance, lost-reasons, allocation]
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: broker_id, in: query, schema: { type: string, format: uuid } }
+        - { name: area_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Report rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  columns: { type: array, items: { type: string } }
+                  rows: { type: array, items: { type: array, items: {} } }
+            text/csv:
+              schema: { type: string }
+
+# =========================================================================
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  parameters:
+    Page: { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+    PerPage: { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+    PropertyCode: { name: code, in: path, required: true, schema: { type: string, example: PR-1042 } }
+    PropertyId: { name: propertyId, in: path, required: true, schema: { type: string, format: uuid } }
+    RoomId: { name: roomId, in: path, required: true, schema: { type: string, format: uuid } }
+    LeadId: { name: leadId, in: path, required: true, schema: { type: string, format: uuid } }
+    VisitId: { name: visitId, in: path, required: true, schema: { type: string, format: uuid } }
+    AssignmentId: { name: assignmentId, in: path, required: true, schema: { type: string, format: uuid } }
+    BrokerId: { name: brokerId, in: path, required: true, schema: { type: string, format: uuid } }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, maxLength: 64 }
+      description: Same key within 24 h returns the original response.
+
+  responses:
+    ValidationFailed:
+      description: '`VALIDATION_FAILED`'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthenticated:
+      description: '`UNAUTHENTICATED` / `OTP_INVALID` / `SESSION_EXPIRED`'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: '`NOT_FOUND` (also returned instead of 403 for records outside your scope)'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: '`RATE_LIMITED`'
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    InvalidTransition:
+      description: '`INVALID_STATUS_TRANSITION`'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    DuplicateActiveLead:
+      description: '`DUPLICATE_ACTIVE_LEAD`: `existing_lead_id` is included when the caller may see that lead.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    BedNotAvailable:
+      description: '`BED_NOT_AVAILABLE`: the bed is already reserved/occupied or under maintenance.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    # ---------------------------------------------------------- common --
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code:
+          type: string
+          enum: [VALIDATION_FAILED, UNAUTHENTICATED, OTP_INVALID, SESSION_EXPIRED, FORBIDDEN, NOT_FOUND,
+                 RATE_LIMITED, DUPLICATE_ACTIVE_LEAD, BED_NOT_AVAILABLE, PROPERTY_NOT_AVAILABLE,
+                 INVALID_STATUS_TRANSITION, LEAD_NOT_OFFERED_TO_YOU, PUBLISH_VALIDATION_FAILED, OVERPAYMENT]
+        detail: { type: string }
+        errors:
+          type: object
+          additionalProperties: { type: array, items: { type: string } }
+          description: Field → messages, for VALIDATION_FAILED
+        existing_lead_id: { type: string, format: uuid }
+    PageMeta:
+      type: object
+      required: [page, per_page, total]
+      properties:
+        page: { type: integer }
+        per_page: { type: integer }
+        total: { type: integer }
+    Money:
+      type: string
+      pattern: '^\d+(\.\d{1,2})?$'
+      example: '8500.00'
+    Phone:
+      type: string
+      pattern: '^\+[1-9]\d{7,14}$'
+      example: '+919876543210'
+    Role: { type: string, enum: [super_admin, broker, student, owner] }
+    PropertyType: { type: string, enum: [pg, hostel, flat, independent_room, shared_house] }
+    PropertyStatus: { type: string, enum: [draft, verification, published, partially_occupied, fully_occupied, unavailable, archived] }
+    LeadStatus:
+      type: string
+      enum: [new, contacted, requirement_confirmed, properties_suggested, visit_scheduled, visited, interested,
+             negotiation, assigned, brokerage_pending, brokerage_paid, move_in_complete,
+             not_interested, lost, student_cancelled, property_unavailable, duplicate]
+    AllocationStatus: { type: string, enum: [unassigned, offered, accepted] }
+    VisitStatus: { type: string, enum: [requested, proposed, confirmed, rescheduled, completed, cancelled, no_show] }
+    AssignmentStatus: { type: string, enum: [draft, pending_confirmation, reserved, confirmed, cancelled, completed] }
+    BedStatus: { type: string, enum: [available, reserved, occupied, maintenance, blocked] }
+    BrokerageStatus: { type: string, enum: [pending, partially_paid, paid, cancelled] }
+    DocumentType: { type: string, enum: [college_id, government_id, agreement, receipt, owner_document, other] }
+
+    Me:
+      type: object
+      required: [id, role, name, phone]
+      properties:
+        id: { type: string, format: uuid }
+        role: { $ref: '#/components/schemas/Role' }
+        name: { type: string }
+        phone: { $ref: '#/components/schemas/Phone' }
+        email: { type: [string, 'null'], format: email }
+        profile_complete: { type: boolean }
+
+    Area:
+      type: object
+      required: [name, city]
+      properties:
+        id: { type: string, format: uuid, readOnly: true }
+        name: { type: string }
+        city: { type: string }
+        parent_area_id: { type: [string, 'null'], format: uuid }
+    College:
+      type: object
+      required: [name]
+      properties:
+        id: { type: string, format: uuid, readOnly: true }
+        name: { type: string }
+        short_name: { type: [string, 'null'] }
+        area_id: { type: [string, 'null'], format: uuid }
+    Amenity:
+      type: object
+      required: [name]
+      properties:
+        id: { type: string, format: uuid, readOnly: true }
+        name: { type: string }
+        category: { type: [string, 'null'] }
+        icon: { type: [string, 'null'] }
+
+    # ---------------------------------------- STUDENT-SAFE (privacy) ----
+    StudentListingCard:
+      type: object
+      additionalProperties: false
+      description: Student-safe. Must never gain owner/address/internal fields.
+      required: [code, title, property_type, area, rent_from, deposit_from, available_beds, cover_photo_url]
+      properties:
+        code: { type: string, example: PR-1042 }
+        title: { type: string }
+        property_type: { $ref: '#/components/schemas/PropertyType' }
+        gender_policy: { type: string, enum: [male, female, any] }
+        area: { type: string, example: 'North Campus, Pune' }
+        locality_label: { type: [string, 'null'], example: Near City Mall }
+        rent_from: { $ref: '#/components/schemas/Money' }
+        rent_to: { $ref: '#/components/schemas/Money' }
+        deposit_from: { $ref: '#/components/schemas/Money' }
+        sharing_options: { type: array, items: { type: integer } }
+        available_beds: { type: integer }
+        available_from: { type: [string, 'null'], format: date }
+        food_included: { type: boolean }
+        top_amenities: { type: array, items: { type: string }, maxItems: 5 }
+        distance_km:
+          type: [number, 'null']
+          description: To the college in the query, or the student's college; rounded to 0.1 km
+        cover_photo_url: { type: [string, 'null'], format: uri }
+        is_shortlisted: { type: [boolean, 'null'], description: null when not signed in }
+
+    StudentListingDetail:
+      type: object
+      additionalProperties: false
+      description: Student-safe property detail. No owner, exact address or exact coordinates.
+      required: [code, title, property_type, area, rent_from, deposit_from, photos, rooms, amenities, approx_location]
+      properties:
+        code: { type: string }
+        title: { type: string }
+        description: { type: [string, 'null'] }
+        property_type: { $ref: '#/components/schemas/PropertyType' }
+        gender_policy: { type: string, enum: [male, female, any] }
+        area: { type: string }
+        locality_label: { type: [string, 'null'] }
+        approx_location:
+          type: object
+          additionalProperties: false
+          description: Fixed approximate point; render as a ~500 m circle, never a pin.
+          properties:
+            latitude: { type: number }
+            longitude: { type: number }
+            radius_m: { type: integer, example: 500 }
+        rent_from: { $ref: '#/components/schemas/Money' }
+        rent_to: { $ref: '#/components/schemas/Money' }
+        deposit_from: { $ref: '#/components/schemas/Money' }
+        maintenance_fee: { oneOf: [{ $ref: '#/components/schemas/Money' }, { type: 'null' }] }
+        food_included: { type: boolean }
+        house_rules: { type: [string, 'null'] }
+        available_from: { type: [string, 'null'], format: date }
+        availability: { type: string, enum: [available, limited, full] }
+        photos:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              url: { type: string, format: uri }
+              caption: { type: [string, 'null'] }
+        amenities: { type: array, items: { type: string } }
+        rooms:
+          type: array
+          items: { $ref: '#/components/schemas/StudentRoomOption' }
+        college_distances:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              college: { type: string }
+              distance_km: { type: number }
+        broker_contact:
+          oneOf:
+            - { $ref: '#/components/schemas/StudentBrokerContact' }
+            - { type: 'null' }
+          description: Per contact policy (D-07). Never the owner.
+        similar: { type: array, items: { $ref: '#/components/schemas/StudentListingCard' }, maxItems: 6 }
+        is_shortlisted: { type: [boolean, 'null'] }
+        my_open_request_id:
+          type: [string, 'null']
+          format: uuid
+          description: Set when the signed-in student already has an active request for this property (CTA becomes "View request").
+
+    StudentRoomOption:
+      type: object
+      additionalProperties: false
+      properties:
+        sharing: { type: integer }
+        room_type: { type: [string, 'null'], enum: [ac, non_ac, null] }
+        attached_bathroom: { type: boolean }
+        rent_per_bed: { $ref: '#/components/schemas/Money' }
+        deposit_per_bed: { $ref: '#/components/schemas/Money' }
+        available_beds: { type: integer }
+        next_available_from: { type: [string, 'null'], format: date }
+
+    StudentBrokerContact:
+      type: object
+      additionalProperties: false
+      properties:
+        display_name: { type: string }
+        business_phone: { $ref: '#/components/schemas/Phone' }
+        whatsapp_url: { type: string, format: uri }
+
+    StudentProfile:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        phone: { $ref: '#/components/schemas/Phone' }
+        email: { type: [string, 'null'], format: email }
+        college_id: { type: [string, 'null'], format: uuid }
+        course: { type: [string, 'null'] }
+        year_of_study: { type: [integer, 'null'] }
+        gender: { type: [string, 'null'], enum: [male, female, other, prefer_not_to_say, null] }
+        budget_min: { oneOf: [{ $ref: '#/components/schemas/Money' }, { type: 'null' }] }
+        budget_max: { oneOf: [{ $ref: '#/components/schemas/Money' }, { type: 'null' }] }
+        preferred_area_ids: { type: array, items: { type: string, format: uuid } }
+        preferred_sharing: { type: array, items: { type: integer } }
+        move_in_from: { type: [string, 'null'], format: date }
+    StudentProfileUpdate:
+      type: object
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+        college_id: { type: string, format: uuid }
+        course: { type: string }
+        year_of_study: { type: integer }
+        gender: { type: string, enum: [male, female, other, prefer_not_to_say] }
+        budget_min: { $ref: '#/components/schemas/Money' }
+        budget_max: { $ref: '#/components/schemas/Money' }
+        preferred_area_ids: { type: array, items: { type: string, format: uuid } }
+        preferred_sharing: { type: array, items: { type: integer } }
+        move_in_from: { type: string, format: date }
+
+    StudentRequestCreate:
+      type: object
+      required: [property_code, type]
+      properties:
+        property_code: { type: string }
+        type: { type: string, enum: [visit, interest] }
+        preferred_slots:
+          type: array
+          maxItems: 3
+          description: Required for type=visit
+          items:
+            type: object
+            required: [date]
+            properties:
+              date: { type: string, format: date }
+              from: { type: string, pattern: '^\d{2}:\d{2}$', example: '17:00' }
+              to: { type: string, pattern: '^\d{2}:\d{2}$', example: '19:00' }
+        people_count: { type: integer, minimum: 1, maximum: 10, default: 1 }
+        note: { type: string, maxLength: 500 }
+        sharing_preference: { type: integer, minimum: 1 }
+        move_in_from: { type: string, format: date }
+
+    RequestReceived:
+      type: object
+      additionalProperties: false
+      required: [request_id, title, message]
+      properties:
+        request_id: { type: string, format: uuid }
+        title: { type: string, const: Request Received }
+        message: { type: string, const: Your property request has been received. Our broker will contact you shortly. }
+
+    StudentRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Student-facing view of a lead. Shows a simplified status only and
+        never shows allocation or reassignment details.
+        Mapping: new/contacted/requirement_confirmed/properties_suggested → request_received
+        (or broker_contacted once a broker acted); visit_scheduled → visit_scheduled;
+        visited/interested/negotiation → visited; assigned/brokerage_* → room_assigned;
+        move_in_complete → moved_in; terminal → closed.
+      required: [id, property, type, display_status, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        property: { $ref: '#/components/schemas/StudentListingCard' }
+        type: { type: string, enum: [visit, interest] }
+        display_status: { type: string, enum: [request_received, broker_contacted, visit_scheduled, visited, room_assigned, moved_in, closed] }
+        closed_reason: { type: [string, 'null'], enum: [cancelled_by_you, property_unavailable, not_proceeding, null] }
+        visits: { type: array, items: { $ref: '#/components/schemas/StudentVisit' } }
+        broker_contact:
+          oneOf:
+            - { $ref: '#/components/schemas/StudentBrokerContact' }
+            - { type: 'null' }
+        timeline:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              at: { type: string, format: date-time }
+              label: { type: string, example: 'Visit confirmed for 14 Oct, 5:00 PM' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    StudentVisit:
+      type: object
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/VisitStatus' }
+        preferred_slots: { type: array, items: { type: object } }
+        scheduled_at: { type: [string, 'null'], format: date-time }
+        people_count: { type: integer }
+        meeting_point:
+          type: [string, 'null']
+          description: Shared only once the visit is confirmed, as chosen by the broker (may be a nearby landmark).
+
+    # ------------------------------------------------- broker / admin ----
+    BrokerDashboard:
+      type: object
+      properties:
+        offered_awaiting_acceptance: { type: integer }
+        new_leads: { type: integer }
+        visits_today: { type: integer }
+        follow_ups_due: { type: integer }
+        follow_ups_overdue: { type: integer }
+        assignments_pending: { type: integer }
+        brokerage_pending_amount: { $ref: '#/components/schemas/Money' }
+        accepting_leads: { type: boolean }
+        active_leads: { type: integer }
+        max_active_leads: { type: integer }
+
+    BrokerAvailability:
+      type: object
+      properties:
+        accepting_leads: { type: boolean }
+        active_leads: { type: integer }
+        max_active_leads: { type: integer }
+        current_unavailability: { oneOf: [{ $ref: '#/components/schemas/Unavailability' }, { type: 'null' }] }
+        upcoming_unavailability: { type: array, items: { $ref: '#/components/schemas/Unavailability' } }
+        eligible_now: { type: boolean, description: true when all automatic-allocation rules pass }
+
+    UnavailabilityCreate:
+      type: object
+      required: [kind, starts_at, ends_at]
+      properties:
+        kind: { type: string, enum: [leave, unavailable] }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        reason: { type: string }
+    Unavailability:
+      allOf:
+        - $ref: '#/components/schemas/UnavailabilityCreate'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            created_by: { type: string, format: uuid }
+            cancelled_at: { type: [string, 'null'], format: date-time }
+
+    BrokerAdminView:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        phone: { $ref: '#/components/schemas/Phone' }
+        display_name: { type: string }
+        business_phone: { type: [string, 'null'] }
+        status: { type: string, enum: [active, suspended, deactivated] }
+        accepting_leads: { type: boolean }
+        max_active_leads: { type: integer }
+        active_leads: { type: integer }
+        offered_leads: { type: integer }
+        on_leave_until: { type: [string, 'null'], format: date-time }
+        eligible_now: { type: boolean }
+        last_assigned_at: { type: [string, 'null'], format: date-time }
+        area_ids: { type: array, items: { type: string, format: uuid } }
+        property_ids: { type: array, items: { type: string, format: uuid } }
+        avg_time_to_accept_minutes: { type: [number, 'null'] }
+
+    LeadRequirements:
+      type: object
+      properties:
+        budget_min: { $ref: '#/components/schemas/Money' }
+        budget_max: { $ref: '#/components/schemas/Money' }
+        sharing: { type: array, items: { type: integer } }
+        area_ids: { type: array, items: { type: string, format: uuid } }
+        college_id: { type: string, format: uuid }
+        move_in_from: { type: string, format: date }
+        notes: { type: string }
+
+    LeadCreate:
+      type: object
+      required: [student_phone, student_name, source]
+      properties:
+        student_phone: { $ref: '#/components/schemas/Phone' }
+        student_name: { type: string }
+        property_id: { type: string, format: uuid }
+        source: { type: string, enum: [walk_in, phone, broker_created, whatsapp_share] }
+        requirements: { $ref: '#/components/schemas/LeadRequirements' }
+        next_action: { $ref: '#/components/schemas/FollowUpCreate' }
+
+    LeadSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: LD-20481 }
+        status: { $ref: '#/components/schemas/LeadStatus' }
+        allocation_status: { $ref: '#/components/schemas/AllocationStatus' }
+        response_due_at: { type: [string, 'null'], format: date-time }
+        student_name: { type: string }
+        college: { type: [string, 'null'] }
+        property: { oneOf: [{ $ref: '#/components/schemas/PropertySummary' }, { type: 'null' }] }
+        broker_id: { type: [string, 'null'], format: uuid }
+        next_follow_up: { oneOf: [{ $ref: '#/components/schemas/FollowUp' }, { type: 'null' }] }
+        source: { type: string }
+        created_at: { type: string, format: date-time }
+
+    LeadDetail:
+      allOf:
+        - $ref: '#/components/schemas/LeadSummary'
+        - type: object
+          properties:
+            student:
+              type: object
+              description: Phone is included only once the lead is accepted (Q-A2).
+              properties:
+                id: { type: string, format: uuid }
+                name: { type: string }
+                phone: { type: [string, 'null'] }
+                college: { type: [string, 'null'] }
+                course: { type: [string, 'null'] }
+                year_of_study: { type: [integer, 'null'] }
+            requirements: { $ref: '#/components/schemas/LeadRequirements' }
+            visits: { type: array, items: { $ref: '#/components/schemas/Visit' } }
+            follow_ups: { type: array, items: { $ref: '#/components/schemas/FollowUp' } }
+            assignments: { type: array, items: { $ref: '#/components/schemas/Assignment' } }
+            status_history:
+              type: array
+              items:
+                type: object
+                properties:
+                  from_status: { type: [string, 'null'] }
+                  to_status: { type: string }
+                  changed_by: { type: [string, 'null'] }
+                  reason: { type: [string, 'null'] }
+                  at: { type: string, format: date-time }
+
+    LeadAssignmentEvent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        lead_id: { type: string, format: uuid }
+        previous_broker: { type: [object, 'null'], properties: { id: { type: string }, name: { type: string } } }
+        new_broker: { type: [object, 'null'], properties: { id: { type: string }, name: { type: string } } }
+        method: { type: string, enum: [automatic, manual] }
+        reason:
+          type: string
+          enum: [property_broker, authorized_fallback, queue_retry, no_eligible_broker, broker_unavailable,
+                 response_timeout, broker_declined, broker_deactivated, manual_reassignment]
+        reason_note: { type: [string, 'null'] }
+        response_due_at: { type: [string, 'null'], format: date-time }
+        assigned_by: { type: [string, 'null'], format: uuid }
+        accepted_at: { type: [string, 'null'], format: date-time }
+        ended_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    FollowUpCreate:
+      type: object
+      required: [action, due_at]
+      properties:
+        action: { type: string, example: Call to confirm budget }
+        due_at: { type: string, format: date-time }
+    FollowUp:
+      allOf:
+        - $ref: '#/components/schemas/FollowUpCreate'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            lead_id: { type: string, format: uuid }
+            status: { type: string, enum: [open, done, snoozed, cancelled] }
+            snooze_reason: { type: [string, 'null'] }
+            completed_at: { type: [string, 'null'], format: date-time }
+
+    Visit:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        lead_id: { type: string, format: uuid }
+        property: { $ref: '#/components/schemas/PropertySummary' }
+        student_name: { type: string }
+        status: { $ref: '#/components/schemas/VisitStatus' }
+        preferred_slots: { type: array, items: { type: object } }
+        scheduled_at: { type: [string, 'null'], format: date-time }
+        people_count: { type: integer }
+        student_note: { type: [string, 'null'] }
+        outcome: { type: [string, 'null'], enum: [interested, not_interested, wants_more_options, negotiating, null] }
+        outcome_note: { type: [string, 'null'] }
+
+    PropertySummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        title: { type: string }
+        area: { type: string }
+        status: { $ref: '#/components/schemas/PropertyStatus' }
+        broker_id: { type: [string, 'null'], format: uuid }
+        rent_from: { $ref: '#/components/schemas/Money' }
+        beds_total: { type: integer }
+        beds_available: { type: integer }
+        beds_reserved: { type: integer }
+        beds_occupied: { type: integer }
+        has_private_details: { type: boolean, description: Drives the "owner-private" indicator in lists }
+
+    PropertyListingInput:
+      type: object
+      required: [title, property_type, area_id]
+      properties:
+        title: { type: string }
+        description: { type: string }
+        property_type: { $ref: '#/components/schemas/PropertyType' }
+        gender_policy: { type: string, enum: [male, female, any] }
+        area_id: { type: string, format: uuid }
+        locality_label: { type: string, description: Must not identify the house (no house number / street number) }
+        maintenance_fee: { $ref: '#/components/schemas/Money' }
+        food_included: { type: boolean }
+        house_rules: { type: string }
+        available_from: { type: string, format: date }
+        amenity_ids: { type: array, items: { type: string, format: uuid } }
+        broker_id: { type: string, format: uuid, description: Super Admin only; defaults to the creator }
+
+    PropertyPrivateInput:
+      type: object
+      required: [owner_id, address_line1]
+      properties:
+        owner_id: { type: string, format: uuid }
+        address_line1: { type: string }
+        address_line2: { type: string }
+        landmark: { type: string }
+        pincode: { type: string }
+        latitude: { type: number }
+        longitude: { type: number }
+        owner_commercial_notes: { type: string }
+
+    PropertyPrivate:
+      description: 'PRIVATE: broker/super-admin only. Shown under "Owner Details — Admin only".'
+      allOf:
+        - $ref: '#/components/schemas/PropertyPrivateInput'
+        - type: object
+          properties:
+            owner: { $ref: '#/components/schemas/Owner' }
+
+    PropertyDetail:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        listing:
+          allOf:
+            - $ref: '#/components/schemas/PropertyListingInput'
+            - type: object
+              properties:
+                status: { $ref: '#/components/schemas/PropertyStatus' }
+                approx_latitude: { type: [number, 'null'] }
+                approx_longitude: { type: [number, 'null'] }
+                min_rent: { oneOf: [{ $ref: '#/components/schemas/Money' }, { type: 'null' }] }
+                max_rent: { oneOf: [{ $ref: '#/components/schemas/Money' }, { type: 'null' }] }
+                verified_at: { type: [string, 'null'], format: date-time }
+                published_at: { type: [string, 'null'], format: date-time }
+        private: { $ref: '#/components/schemas/PropertyPrivate' }
+        photos: { type: array, items: { $ref: '#/components/schemas/Photo' } }
+        rooms: { type: array, items: { $ref: '#/components/schemas/Room' } }
+        student_preview_url: { type: string, format: uri, description: Opens the listing exactly as students see it }
+
+    Owner:
+      allOf:
+        - $ref: '#/components/schemas/OwnerInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            property_count: { type: integer }
+    OwnerInput:
+      type: object
+      required: [name, phone]
+      properties:
+        name: { type: string }
+        phone: { $ref: '#/components/schemas/Phone' }
+        alternate_phone: { $ref: '#/components/schemas/Phone' }
+        email: { type: string, format: email }
+        address: { type: string }
+        notes: { type: string }
+
+    Photo:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri, description: 'Signed, short-lived' }
+        room_id: { type: [string, 'null'], format: uuid }
+        caption: { type: [string, 'null'] }
+        sort_order: { type: integer }
+        privacy_checked: { type: boolean }
+        is_public: { type: boolean }
+
+    RoomCreate:
+      type: object
+      required: [label, sharing, rent_per_bed, deposit_per_bed]
+      properties:
+        label: { type: string }
+        sharing: { type: integer, minimum: 1, maximum: 12 }
+        room_type: { type: string, enum: [ac, non_ac] }
+        attached_bathroom: { type: boolean }
+        rent_per_bed: { $ref: '#/components/schemas/Money' }
+        deposit_per_bed: { $ref: '#/components/schemas/Money' }
+        maintenance_per_bed: { $ref: '#/components/schemas/Money' }
+        beds:
+          type: array
+          items: { type: string }
+          description: Bed labels; defaults to A, B, C… for `sharing` beds
+    Room:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        property_id: { type: string, format: uuid }
+        label: { type: string }
+        sharing: { type: integer }
+        room_type: { type: [string, 'null'] }
+        attached_bathroom: { type: boolean }
+        rent_per_bed: { $ref: '#/components/schemas/Money' }
+        deposit_per_bed: { $ref: '#/components/schemas/Money' }
+        maintenance_per_bed: { $ref: '#/components/schemas/Money' }
+        status: { type: string, enum: [active, maintenance, blocked] }
+        beds: { type: array, items: { $ref: '#/components/schemas/Bed' } }
+        scheduled_rent_change:
+          type: [object, 'null']
+          properties:
+            rent_per_bed: { $ref: '#/components/schemas/Money' }
+            deposit_per_bed: { $ref: '#/components/schemas/Money' }
+            effective_from: { type: string, format: date }
+    Bed:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        label: { type: string }
+        status: { $ref: '#/components/schemas/BedStatus' }
+        available_from: { type: [string, 'null'], format: date }
+        current_assignment_id: { type: [string, 'null'], format: uuid }
+
+    AssignmentCreate:
+      type: object
+      required: [lead_id, bed_id]
+      properties:
+        lead_id: { type: string, format: uuid }
+        bed_id: { type: string, format: uuid }
+        hold: { type: boolean, default: false }
+        reserved_until: { type: string, format: date-time }
+        move_in_date: { type: string, format: date }
+        agreed_terms: { type: string }
+        rent_override: { $ref: '#/components/schemas/Money' }
+        deposit_override: { $ref: '#/components/schemas/Money' }
+    Assignment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: AS-3307 }
+        lead_id: { type: string, format: uuid }
+        student: { type: object, properties: { id: { type: string }, name: { type: string } } }
+        property: { $ref: '#/components/schemas/PropertySummary' }
+        room_id: { type: string, format: uuid }
+        room_label: { type: string }
+        bed_id: { type: string, format: uuid }
+        bed_label: { type: string }
+        broker_id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/AssignmentStatus' }
+        rent_snapshot: { $ref: '#/components/schemas/Money' }
+        deposit_snapshot: { $ref: '#/components/schemas/Money' }
+        maintenance_snapshot: { $ref: '#/components/schemas/Money' }
+        agreed_terms: { type: [string, 'null'] }
+        move_in_date: { type: [string, 'null'], format: date }
+        reserved_until: { type: [string, 'null'], format: date-time }
+        owner_confirmed_at: { type: [string, 'null'], format: date-time }
+        confirmed_at: { type: [string, 'null'], format: date-time }
+        moved_in_at: { type: [string, 'null'], format: date-time }
+        vacated_at: { type: [string, 'null'], format: date-time }
+        brokerages: { type: array, items: { $ref: '#/components/schemas/Brokerage' } }
+
+    BrokerageRule:
+      type: object
+      required: [name, calc_type, value, payer]
+      properties:
+        id: { type: string, format: uuid, readOnly: true }
+        name: { type: string }
+        calc_type: { type: string, enum: [flat, percent_of_monthly_rent, months_of_rent] }
+        value: { $ref: '#/components/schemas/Money' }
+        payer: { type: string, enum: [student, owner] }
+        area_id: { type: [string, 'null'], format: uuid }
+        property_type: { oneOf: [{ $ref: '#/components/schemas/PropertyType' }, { type: 'null' }] }
+        priority: { type: integer }
+        is_active: { type: boolean }
+
+    Brokerage:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        assignment_id: { type: string, format: uuid }
+        assignment_code: { type: string }
+        student_name: { type: string }
+        property_code: { type: string }
+        payer: { type: string, enum: [student, owner] }
+        amount: { $ref: '#/components/schemas/Money' }
+        paid_amount: { $ref: '#/components/schemas/Money' }
+        balance: { $ref: '#/components/schemas/Money' }
+        status: { $ref: '#/components/schemas/BrokerageStatus' }
+        due_date: { type: [string, 'null'], format: date }
+        rule_snapshot: { type: object }
+        payments: { type: array, items: { $ref: '#/components/schemas/Payment' } }
+
+    PaymentCreate:
+      type: object
+      required: [amount, method, received_at]
+      properties:
+        amount: { $ref: '#/components/schemas/Money' }
+        method: { type: string, enum: [upi, cash, bank_transfer] }
+        reference: { type: string, description: Required unless method is cash }
+        received_at: { type: string, format: date-time }
+        receipt_document_id: { type: string, format: uuid, description: Optional uploaded proof (screenshot) }
+    Payment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        brokerage_id: { type: string, format: uuid }
+        amount: { $ref: '#/components/schemas/Money' }
+        method: { type: string, enum: [upi, cash, bank_transfer, online_gateway] }
+        reference: { type: [string, 'null'] }
+        received_at: { type: string, format: date-time }
+        receipt_number: { type: string, example: RC-2026-000123 }
+        status: { type: string, enum: [recorded, voided] }
+        void_reason: { type: [string, 'null'] }
+        recorded_by: { type: string, format: uuid }
+
+    Document:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        subject_type: { type: string }
+        subject_id: { type: string, format: uuid }
+        doc_type: { $ref: '#/components/schemas/DocumentType' }
+        file_name: { type: string }
+        mime_type: { type: string }
+        size_bytes: { type: integer }
+        purpose: { type: string }
+        retention_until: { type: [string, 'null'], format: date }
+        uploaded_at: { type: string, format: date-time }
+
+    Notification:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, example: lead.offered }
+        title: { type: string }
+        body: { type: string }
+        data: { type: object, description: Deep-link ids only }
+        read_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    Settings:
+      type: object
+      properties:
+        allocation:
+          type: object
+          properties:
+            response_window_minutes: { type: integer, minimum: 5, default: 30 }
+            business_hours:
+              type: object
+              properties:
+                tz: { type: string, default: Asia/Kolkata }
+                start: { type: string, default: '09:00' }
+                end: { type: string, default: '21:00' }
+                days: { type: array, items: { type: integer, minimum: 1, maximum: 7 } }
+            unassigned_escalation_minutes: { type: integer, default: 60 }
+            max_auto_offers_per_lead: { type: integer, default: 5 }
+            default_max_active_leads: { type: integer, default: 40 }
+        contact:
+          type: object
+          properties:
+            broker_visibility: { type: string, enum: [after_acceptance, always, never], default: after_acceptance }
+        marketplace:
+          type: object
+          properties:
+            require_login: { type: boolean, default: false }
+            approx_location_radius_m: { type: integer, default: 500 }
+        assignments:
+          type: object
+          properties:
+            default_reservation_hours: { type: integer, default: 48 }
+
+    AuditLog:
+      type: object
+      properties:
+        id: { type: integer }
+        actor_id: { type: [string, 'null'], format: uuid }
+        actor_name: { type: [string, 'null'] }
+        action: { type: string, example: lead.reassigned }
+        entity_type: { type: string }
+        entity_id: { type: [string, 'null'], format: uuid }
+        metadata: { type: object }
+        ip: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }

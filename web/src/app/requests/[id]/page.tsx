@@ -126,7 +126,7 @@ export default async function RequestPage({ params, searchParams }: { params: Pr
         </ol>
       </section>
 
-      {!closed && <CancelRequestButton requestId={r.id} />}
+      {!closed && !["room_assigned", "moved_in"].includes(r.display_status) && <CancelRequestButton requestId={r.id} />}
       {process.env.PROTOTYPE_TOOLS !== "off" && !closed && !r.broker_contact && (
         <aside className="rounded-xl border-2 border-dashed border-amber-300 bg-amber-50/60 p-4 text-sm" aria-label="Prototype note">
           <p className="font-semibold text-attention">Prototype demo</p>
